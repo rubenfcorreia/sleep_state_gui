@@ -1,32 +1,44 @@
 import sys
 import os
+import getpass
 import pickle
 import shutil
 import time
+import tempfile
 import cv2
 import numpy as np
 
-from PyQt5 import QtWidgets, QtCore, QtGui
-from PyQt5.QtWidgets import (
+from PyQt6 import QtWidgets, QtCore, QtGui
+from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QSlider, QMessageBox, QSizePolicy,
     QCheckBox, QRadioButton, QButtonGroup, QProgressBar, QDoubleSpinBox,
-    QInputDialog, QDialog, QDialogButtonBox,
+    QInputDialog, QDialog, QDialogButtonBox, QPlainTextEdit,
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer
 
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_qt5 import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.widgets import SpanSelector, Slider
 from scipy import signal
 from scipy.interpolate import interp1d
 
-import organise_paths
+from pathlib import Path
+
+try:
+    from preprocess_pipeline.shared import paths
+except ModuleNotFoundError:
+    # Allow direct execution from this standalone checkout.
+    _lab_pipeline_src = Path(__file__).resolve().parents[1] / "lab_pipeline" / "src"
+    if _lab_pipeline_src.is_dir() and str(_lab_pipeline_src) not in sys.path:
+        sys.path.insert(0, str(_lab_pipeline_src))
+    from preprocess_pipeline.shared import paths
 from sleep_score import (
     run_sleep_scoring,
     score_from_epoch_features,
     build_epoch_feature_dict,
+    build_locomotion_epoch_mask,
     DEFAULT_DELTA_BAND,
     DEFAULT_THETA_BAND,
     DEFAULT_LOW_FREQ_MAX_HZ,
@@ -34,6 +46,8 @@ from sleep_score import (
     DEFAULT_MIN_SLEEP_STATE_SEC,
     DEFAULT_USER_ID,
     DEFAULT_EXP_ID,
+    compute_shared_low_freq_pca_group,
+    estimate_thresholds_from_epoch_features,
 )
 
 
@@ -271,7 +285,7 @@ class VideoDisplayLabel(QLabel):
         self.on_double_click = on_double_click
 
     def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.LeftButton and callable(self.on_double_click):
+        if event.button() == Qt.MouseButton.LeftButton and callable(self.on_double_click):
             self.on_double_click(self.eye_key)
             event.accept()
             return
@@ -281,31 +295,40 @@ class VideoDisplayLabel(QLabel):
 class CropSelectLabel(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setMouseTracking(True)
         self._origin = None
-        self._rubber_band = QtWidgets.QRubberBand(QtWidgets.QRubberBand.Rectangle, self)
+        self._rubber_band = QtWidgets.QRubberBand(QtWidgets.QRubberBand.Shape.Rectangle, self)
         self._selection = QtCore.QRect()
 
+    def _update_selection(self, position):
+        if self._origin is None:
+            return
+        selection = QtCore.QRect(self._origin, position).normalized()
+        self._selection = selection
+        if selection.width() > 0 and selection.height() > 0:
+            self._rubber_band.setGeometry(selection)
+            self._rubber_band.show()
+        else:
+            self._rubber_band.hide()
+
     def mousePressEvent(self, event):
-        if event.button() != Qt.LeftButton:
+        if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
-        self._origin = event.pos()
-        self._selection = QtCore.QRect(self._origin, QtCore.QSize())
-        self._rubber_band.setGeometry(self._selection)
-        self._rubber_band.show()
+        self._origin = event.position().toPoint()
+        self._selection = QtCore.QRect()
+        self._rubber_band.hide()
         event.accept()
 
     def mouseMoveEvent(self, event):
         if self._origin is None:
             return super().mouseMoveEvent(event)
-        self._selection = QtCore.QRect(self._origin, event.pos()).normalized()
-        self._rubber_band.setGeometry(self._selection)
+        self._update_selection(event.position().toPoint())
         event.accept()
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and self._origin is not None:
-            self._selection = QtCore.QRect(self._origin, event.pos()).normalized()
-            self._rubber_band.setGeometry(self._selection)
+        if event.button() == Qt.MouseButton.LeftButton and self._origin is not None:
+            self._update_selection(event.position().toPoint())
             self._origin = None
             event.accept()
             return
@@ -322,7 +345,7 @@ class VideoCropDialog(QDialog):
         self._selected_rect = None
 
         h, w, _ = frame_rgb.shape
-        qimg = QtGui.QImage(frame_rgb.data, w, h, frame_rgb.strides[0], QtGui.QImage.Format_RGB888)
+        qimg = QtGui.QImage(frame_rgb.data, w, h, frame_rgb.strides[0], QtGui.QImage.Format.Format_RGB888)
         pixmap = QtGui.QPixmap.fromImage(qimg.copy())
 
         layout = QVBoxLayout(self)
@@ -334,7 +357,7 @@ class VideoCropDialog(QDialog):
         hint = QLabel("Drag a rectangle, then press OK.")
         layout.addWidget(hint)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -393,7 +416,7 @@ class ClipboardSafeLineEdit(QLineEdit):
         if clipboard is None:
             return
         try:
-            clipboard.clear(mode=QtGui.QClipboard.Selection)
+            clipboard.clear(mode=QtGui.QClipboard.Mode.Selection)
         except Exception:
             pass
 
@@ -401,8 +424,8 @@ class ClipboardSafeLineEdit(QLineEdit):
         had_selection = self.hasSelectedText()
         key = event.key()
         replacing_selection = bool(had_selection and event.text())
-        deleting = key in (Qt.Key_Backspace, Qt.Key_Delete)
-        cutting = event.matches(QtGui.QKeySequence.Cut)
+        deleting = key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete)
+        cutting = event.matches(QtGui.QKeySequence.StandardKey.Cut)
         super().keyPressEvent(event)
         if deleting or cutting or replacing_selection:
             self._clear_primary_selection()
@@ -423,11 +446,42 @@ class ThresholdHistogramDialog(QtWidgets.QDialog):
         layout = QVBoxLayout()
         layout.setContentsMargins(8, 8, 8, 8)
         self.setLayout(layout)
+        group_label = QLabel("Distribution Exp IDs (comma or newline separated):")
+        layout.addWidget(group_label)
+        self.group_ids_edit = QPlainTextEdit()
+        self.group_ids_edit.setPlaceholderText("2025-06-12_01_MOUSE, 2025-06-12_02_MOUSE")
+        self.group_ids_edit.setFixedHeight(52)
+        layout.addWidget(self.group_ids_edit)
+        group_controls = QHBoxLayout()
+        self.calculate_group_button = QPushButton("Calculate shared group features")
+        self.calculate_group_button.clicked.connect(self.calculate_group_features)
+        group_controls.addWidget(self.calculate_group_button)
+        self.use_group_check = QCheckBox("Use grouped distributions")
+        self.use_group_check.setEnabled(False)
+        self.use_group_check.toggled.connect(self._on_group_toggled)
+        group_controls.addWidget(self.use_group_check)
+        self.estimate_group_button = QPushButton("Estimate group thresholds")
+        self.estimate_group_button.setEnabled(False)
+        self.estimate_group_button.clicked.connect(self.estimate_group_thresholds)
+        group_controls.addWidget(self.estimate_group_button)
+        self.apply_group_button = QPushButton("Apply and save to all selected")
+        self.apply_group_button.setEnabled(False)
+        self.apply_group_button.clicked.connect(self.apply_group_features)
+        group_controls.addWidget(self.apply_group_button)
+        layout.addLayout(group_controls)
+        self.group_status = QLabel("Current experiment only")
+        self.group_status.setStyleSheet("color: gray;")
+        layout.addWidget(self.group_status)
         self.figure = Figure(figsize=(6, 8))
         self.canvas = FigureCanvas(self.figure)
         layout.addWidget(self.canvas)
         self._threshold_lines = {}
         self._threshold_texts = {}
+        self._group_result = None
+        self._group_ids = []
+        self._last_refreshed_exp_id = ""
+        if hasattr(self.app, "excludeLocomotionCheck"):
+            self.app.excludeLocomotionCheck.toggled.connect(self._on_external_mask_changed)
         self._config_by_metric = {
             metric: (label, data_attr, thr_attr, color)
             for metric, label, data_attr, thr_attr, color in self.METRIC_CONFIG
@@ -436,6 +490,11 @@ class ThresholdHistogramDialog(QtWidgets.QDialog):
     def refresh(self):
         if not getattr(self.app, "loaded", False):
             return
+        current_id = str(getattr(self.app, "expID", "")).strip()
+        current_text = self.group_ids_edit.toPlainText().strip()
+        if current_id and (not current_text or current_text == self._last_refreshed_exp_id):
+            self.group_ids_edit.setPlainText(current_id)
+        self._last_refreshed_exp_id = current_id
         self._disconnect_lines()
         self.figure.clf()
         axes = self.figure.subplots(len(self.METRIC_CONFIG), 1, sharex=False)
@@ -446,8 +505,7 @@ class ThresholdHistogramDialog(QtWidgets.QDialog):
 
         for ax, (metric, label, data_attr, thr_attr, color) in zip(axes, self.METRIC_CONFIG):
             ax.clear()
-            data = getattr(self.app, data_attr, None)
-            arr = np.asarray(data, dtype=float) if data is not None else np.array([], dtype=float)
+            arr = self._distribution_values(metric, data_attr)
             finite = arr[np.isfinite(arr)]
             if finite.size > 0:
                 bins = self._choose_bins(finite.size)
@@ -498,7 +556,191 @@ class ThresholdHistogramDialog(QtWidgets.QDialog):
             self._extend_xlim(ax, finite, threshold)
 
         self.figure.tight_layout(pad=1.0)
-        self.canvas.draw_idle()
+        # Draw synchronously because this dialog is refreshed before it is
+        # shown; relying only on draw_idle can leave the new contents blank
+        # until another window event (such as moving the dialog) occurs.
+        self.canvas.draw()
+
+    def _distribution_values(self, metric_key, data_attr):
+        if self.use_group_check.isChecked() and self._group_result is not None:
+            if metric_key == "low_freq":
+                return np.asarray(self._group_result["pooled_low_freq_power_smoothed"], dtype=float)
+            feature_key = {
+                "emg": "emg_rms_mean",
+                "ratio": "theta_delta_ratio_smoothed",
+            }.get(metric_key)
+            if feature_key is not None:
+                values = []
+                for item in self._group_result["source_states"]:
+                    features = item.get("epoch_features", {})
+                    current = np.asarray(features.get(feature_key, []), dtype=float).copy()
+                    if self.app.exclude_locomotion_epochs:
+                        moving = build_locomotion_epoch_mask(
+                            features, self.app.locomotion_threshold
+                        )
+                        if moving.size == current.size:
+                            current[moving] = np.nan
+                    values.append(current)
+                if values:
+                    return np.concatenate(values)
+        return self.app._threshold_distribution_values(data_attr)
+
+    def _parse_group_ids(self):
+        raw = self.group_ids_edit.toPlainText().replace(",", "\n")
+        ids = []
+        duplicates = []
+        for value in raw.splitlines():
+            exp_id = value.strip()
+            if not exp_id:
+                continue
+            if exp_id in ids and exp_id not in duplicates:
+                duplicates.append(exp_id)
+            elif exp_id not in ids:
+                ids.append(exp_id)
+        if duplicates:
+            raise ValueError(
+                "The following ExpID(s) were entered more than once: "
+                + ", ".join(duplicates)
+            )
+        current_id = str(getattr(self.app, "expID", "")).strip()
+        if current_id and current_id not in ids:
+            ids.insert(0, current_id)
+        if not ids:
+            raise ValueError("enter at least one ExpID")
+        date_groups = {}
+        for exp_id in ids:
+            date_prefix = exp_id.split("_", 1)[0]
+            date_groups.setdefault(date_prefix, []).append(exp_id)
+        if len(date_groups) != 1:
+            details = "; ".join(
+                f"{date}: {', '.join(group)}"
+                for date, group in sorted(date_groups.items())
+            )
+            raise ValueError(
+                "ExpIDs from different days cannot be combined. " + details
+            )
+        return ids
+
+    def _load_group_states(self, exp_ids):
+        states = []
+        reference = self.app.loaded_sleep_state
+        for exp_id in exp_ids:
+            _, _, _, processed, _ = paths.find_paths(self.app.userID, exp_id)
+            path = os.path.join(processed, "sleep_score", self.app._sleep_state_basename())
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"{exp_id}: {os.path.basename(path)} not found")
+            with open(path, "rb") as handle:
+                state = pickle.load(handle)
+            ok, error = self.app._validate_sleep_state_dict(state, path)
+            if not ok:
+                raise ValueError(error)
+            for field in ("delta_band", "theta_band", "low_freq_max_hz"):
+                if field in reference and field in state:
+                    left = np.asarray(reference[field], dtype=float)
+                    right = np.asarray(state[field], dtype=float)
+                    if left.shape != right.shape or not np.allclose(left, right):
+                        raise ValueError(f"{exp_id}: incompatible {field}")
+            states.append({"exp_id": exp_id, "path": path, "state": state})
+        return states
+
+    def calculate_group_features(self):
+        try:
+            exp_ids = self._parse_group_ids()
+            source_states = self._load_group_states(exp_ids)
+            result = compute_shared_low_freq_pca_group(
+                self.app.userID,
+                exp_ids,
+                low_freq_max_hz=float(self.app.low_freq_max_hz),
+                locomotion_threshold=float(self.app.locomotion_threshold),
+                exclude_locomotion_epochs=bool(self.app.exclude_locomotion_epochs),
+                simulated_npz=self.app._simulation_npz_path(),
+                progress_callback=self._group_progress,
+            )
+            result["source_states"] = [item["state"] for item in source_states]
+            result["source_paths"] = [item["path"] for item in source_states]
+            self._group_result = result
+            self._group_ids = exp_ids
+            self.use_group_check.setEnabled(True)
+            self.use_group_check.setChecked(True)
+            self.estimate_group_button.setEnabled(True)
+            self.apply_group_button.setEnabled(True)
+            self.estimate_group_thresholds()
+            self.group_status.setText(f"Shared PCA ready for {len(exp_ids)} ExpIDs")
+            self.refresh()
+        except Exception as exc:
+            self._group_result = None
+            self.use_group_check.setChecked(False)
+            self.use_group_check.setEnabled(False)
+            self.estimate_group_button.setEnabled(False)
+            self.apply_group_button.setEnabled(False)
+            self.group_status.setText(f"Group error: {exc}")
+
+    def _group_progress(self, _fraction, message):
+        self.group_status.setText(str(message))
+        QApplication.processEvents()
+
+    def _on_group_toggled(self, checked):
+        if checked and self._group_result is None:
+            self.use_group_check.setChecked(False)
+            return
+        self.refresh()
+
+    def _on_external_mask_changed(self, _checked):
+        if self._group_result is not None and self.isVisible():
+            self.calculate_group_features()
+
+    def estimate_group_thresholds(self):
+        if self._group_result is None:
+            return
+        emg_values = []
+        ratio_values = []
+        for source in self._group_result["source_states"]:
+            features = source.get("epoch_features", {})
+            emg = np.asarray(features.get("emg_rms_mean", []), dtype=float).copy()
+            ratio = np.asarray(features.get("theta_delta_ratio_smoothed", []), dtype=float).copy()
+            if self.app.exclude_locomotion_epochs:
+                moving = build_locomotion_epoch_mask(features, self.app.locomotion_threshold)
+                if moving.size == emg.size:
+                    emg[moving] = np.nan
+                if moving.size == ratio.size:
+                    ratio[moving] = np.nan
+            emg_values.append(emg)
+            ratio_values.append(ratio)
+        pooled = {
+            "emg_rms_mean": np.concatenate(emg_values) if emg_values else np.array([]),
+            "theta_delta_ratio_smoothed": np.concatenate(ratio_values) if ratio_values else np.array([]),
+            "low_freq_power_smoothed": np.asarray(
+                self._group_result["pooled_low_freq_power_smoothed"], dtype=float
+            ),
+        }
+        estimated = estimate_thresholds_from_epoch_features(
+            pooled,
+            default_locomotion_threshold=float(self.app.locomotion_threshold),
+            exclude_locomotion_epochs=False,
+        )
+        for attr, key in (
+            ("emg_rms_threshold", "emg_rms_threshold"),
+            ("low_freq_threshold", "low_freq_threshold"),
+            ("theta_delta_ratio_threshold", "theta_ratio_threshold"),
+        ):
+            value = estimated.get(key, np.nan)
+            if np.isfinite(value):
+                setattr(self.app, attr, float(value))
+        self.app.delta_power_threshold = float(self.app.low_freq_threshold)
+        self.app._rebuild_threshold_widgets_for_current_values()
+        self.app._sync_threshold_widgets_to_values()
+        self.app.rerun_classification()
+        self.group_status.setText("Estimated thresholds from the grouped distribution")
+        self.refresh()
+
+    def apply_group_features(self):
+        if self._group_result is None:
+            return
+        try:
+            self.app.apply_group_result(self._group_result, self._group_ids)
+            self.group_status.setText(f"Applied and saved to {len(self._group_ids)} ExpIDs")
+        except Exception as exc:
+            QMessageBox.critical(self, "Group save error", str(exc))
 
     def sync_thresholds(self):
         if not self._threshold_lines:
@@ -544,8 +786,7 @@ class ThresholdHistogramDialog(QtWidgets.QDialog):
         threshold = getattr(self.app, thr_attr, np.nan)
         if np.isfinite(threshold):
             return float(threshold)
-        data = getattr(self.app, data_attr, None)
-        arr = np.asarray(data, dtype=float) if data is not None else np.array([], dtype=float)
+        arr = self.app._threshold_distribution_values(data_attr)
         finite = arr[np.isfinite(arr)]
         if finite.size > 0:
             return float(np.nanmedian(finite))
@@ -597,6 +838,7 @@ class VideoAnalysisApp(QMainWindow):
         self.theta_delta_ratio_threshold = None
         self.delta_power_threshold = None
         self.locomotion_threshold = DEFAULT_LOCOMOTION_THRESHOLD
+        self.exclude_locomotion_epochs = False
         self.min_sleep_state_sec = DEFAULT_MIN_SLEEP_STATE_SEC
         self.rem_only_from_nrem = True
         self._saved_threshold_values = {}
@@ -680,6 +922,7 @@ class VideoAnalysisApp(QMainWindow):
         self.low_freq_power = None
         self.low_freq_power_smoothed = None
         self._histogram_dialog = None
+        self._reset_plot_view_on_next_refresh = False
 
         self.initUI()
 
@@ -704,7 +947,11 @@ class VideoAnalysisApp(QMainWindow):
         inputRow1 = QHBoxLayout()
         self.userIdEdit = ClipboardSafeLineEdit()
         self.userIdEdit.setPlaceholderText("Enter User ID")
-        self.userIdEdit.setText(DEFAULT_USER_ID)
+        try:
+            detected_user_id = getpass.getuser().strip()
+        except Exception:
+            detected_user_id = ""
+        self.userIdEdit.setText(detected_user_id or DEFAULT_USER_ID)
         inputRow1.addWidget(QLabel("User ID:"))
         inputRow1.addWidget(self.userIdEdit)
 
@@ -733,11 +980,25 @@ class VideoAnalysisApp(QMainWindow):
 
         # --- Playback controls ---
         sliderRow = QHBoxLayout()
-        self.slider = QSlider(Qt.Horizontal)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self.updateFrame)
         sliderRow.addWidget(self.slider)
         controlsLayout.addLayout(sliderRow)
+
+        selectionRow = QHBoxLayout()
+        self.setSelectionStartButton = QPushButton("Set start")
+        self.setSelectionStartButton.setEnabled(False)
+        self.setSelectionStartButton.setToolTip("Set the selection start at the current timeline position")
+        self.setSelectionStartButton.clicked.connect(self._set_selection_start_from_slider)
+        self.setSelectionEndButton = QPushButton("Set end")
+        self.setSelectionEndButton.setEnabled(False)
+        self.setSelectionEndButton.setToolTip("Set the selection end at the current timeline position")
+        self.setSelectionEndButton.clicked.connect(self._set_selection_end_from_slider)
+        selectionRow.addWidget(self.setSelectionStartButton)
+        selectionRow.addWidget(self.setSelectionEndButton)
+        selectionRow.addStretch(1)
+        controlsLayout.addLayout(selectionRow)
 
         playbackRow = QHBoxLayout()
         self.playButton = QPushButton("Play")
@@ -753,7 +1014,7 @@ class VideoAnalysisApp(QMainWindow):
         self.frameJumpEdit.returnPressed.connect(self.jumpToTypedFrame)
         self.centerViewBtn = QPushButton("Jump to View Center")
         self.centerViewBtn.setEnabled(False)
-        self.centerViewBtn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.centerViewBtn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         playbackRow.addWidget(self.playButton)
         playbackRow.addWidget(self.stopButton)
         playbackRow.addWidget(QLabel("Current / Go to:"))
@@ -832,7 +1093,7 @@ class VideoAnalysisApp(QMainWindow):
 
         specRangeRow = QHBoxLayout()
         self.specMinLabel = QLabel("Spec min pct: 5.0")
-        self.specRangeMinSlider = QSlider(Qt.Horizontal)
+        self.specRangeMinSlider = QSlider(Qt.Orientation.Horizontal)
         self.specRangeMinSlider.setRange(0, 1000)  # 0.0..100.0 percentile
         self.specRangeMinSlider.setValue(50)
         self.specRangeMinSlider.setEnabled(False)
@@ -843,7 +1104,7 @@ class VideoAnalysisApp(QMainWindow):
 
         specRangeRow2 = QHBoxLayout()
         self.specMaxLabel = QLabel("Spec max pct: 95.0")
-        self.specRangeMaxSlider = QSlider(Qt.Horizontal)
+        self.specRangeMaxSlider = QSlider(Qt.Orientation.Horizontal)
         self.specRangeMaxSlider.setRange(0, 1000)  # 0.0..100.0 percentile
         self.specRangeMaxSlider.setValue(950)
         self.specRangeMaxSlider.setEnabled(False)
@@ -894,7 +1155,6 @@ class VideoAnalysisApp(QMainWindow):
         self.saveButton = QPushButton("Save scoring")
         self.saveButton.setEnabled(False)
         self.saveButton.clicked.connect(self.saveSleepScoring)
-        modeRow2.addWidget(self.saveButton)
         controlsLayout.addLayout(modeRow2)
 
         # --- Delta/Theta band controls ---
@@ -995,9 +1255,24 @@ class VideoAnalysisApp(QMainWindow):
         thresholdPanelLayout.addWidget(QLabel("Locomotion"), 4, 0)
         thresholdPanelLayout.addWidget(self.locomotionThresholdEdit, 4, 1)
         thresholdPanelLayout.addWidget(self._threshold_revert_buttons["locomotion_threshold"], 4, 2)
+        self.excludeLocomotionCheck = QCheckBox(
+            "Exclude locomotion epochs from EEG thresholds and plots"
+        )
+        self.excludeLocomotionCheck.setChecked(False)
+        self.excludeLocomotionCheck.toggled.connect(self._on_locomotion_mask_toggled)
+        thresholdPanelLayout.addWidget(self.excludeLocomotionCheck, 5, 0, 1, 3)
         controlsLayout.addWidget(thresholdPanel)
 
         controlsLayout.addStretch(1)
+
+        self.saveButton.setMinimumHeight(44)
+        self.saveButton.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.saveButton.setStyleSheet(
+            "QPushButton { background-color: #2f6fbb; color: white; font-size: 14px; "
+            "font-weight: 600; padding: 10px 12px; }"
+            "QPushButton:disabled { background-color: #9bb7d6; color: #f3f3f3; }"
+        )
+        controlsLayout.addWidget(self.saveButton)
 
         self.rescoreButton = QPushButton("Rescore")
         self.rescoreButton.setEnabled(False)
@@ -1006,13 +1281,13 @@ class VideoAnalysisApp(QMainWindow):
             "QPushButton { background-color: #1f9d55; color: white; font-weight: 600; padding: 8px; }"
             "QPushButton:disabled { background-color: #8abf9f; color: #f3f3f3; }"
         )
-        self.rescoreButton.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.rescoreButton.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         controlsLayout.addWidget(self.rescoreButton)
 
         # --- Matplotlib canvas ---
         self.figure = Figure(figsize=(8, 8))
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.canvas.updateGeometry()
         plotsLayout.addWidget(self.canvas)
 
@@ -1116,7 +1391,7 @@ class VideoAnalysisApp(QMainWindow):
 
         # paths
         self.animalID, self.remote_repository_root, self.processed_root, \
-            self.exp_dir_processed, self.exp_dir_raw = organise_paths.find_paths(self.userID, self.expID)
+            self.exp_dir_processed, self.exp_dir_raw = paths.find_paths(self.userID, self.expID)
         self.exp_dir_processed_recordings = os.path.join(self.exp_dir_processed, 'recordings')
 
         # metadata with state labels (if present)
@@ -1181,9 +1456,9 @@ class VideoAnalysisApp(QMainWindow):
                     self,
                     "Sleep scoring error",
                     f"Error loading {sleep_state_name}:\n{e}\n\nDo you want to rerun sleep scoring now?",
-                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
-                if reply == QMessageBox.Yes:
+                if reply == QMessageBox.StandardButton.Yes:
                     bands = self._parse_band_entries()
                     if bands is None:
                         return
@@ -1203,9 +1478,9 @@ class VideoAnalysisApp(QMainWindow):
                 self,
                 "Sleep scoring not found",
                 f"{sleep_state_name} was not found.\nDo you want to run sleep scoring now?",
-                QMessageBox.Yes | QMessageBox.No
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-            if reply == QMessageBox.Yes:
+            if reply == QMessageBox.StandardButton.Yes:
                 bands = self._parse_band_entries()
                 if bands is None:
                     return
@@ -1227,9 +1502,9 @@ class VideoAnalysisApp(QMainWindow):
                 self,
                 "Sleep scoring file outdated",
                 f"{err_msg}\nThis experiment needs to be rescored.\nRun sleep scoring now?",
-                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            if reply == QMessageBox.Yes:
+            if reply == QMessageBox.StandardButton.Yes:
                 bands = self._parse_band_entries()
                 if bands is None:
                     return
@@ -1295,6 +1570,7 @@ class VideoAnalysisApp(QMainWindow):
         locomotion_threshold=None,
         min_sleep_state_sec=None,
         rem_only_from_nrem=None,
+        save_output=True,
     ):
         progress_dialog = ScoringProgressDialog(self)
         progress_dialog.show()
@@ -1327,9 +1603,11 @@ class VideoAnalysisApp(QMainWindow):
                 locomotion_threshold=locomotion_threshold,
                 min_sleep_state_sec=min_sleep_state_sec,
                 rem_only_from_nrem=rem_only_from_nrem,
+                exclude_locomotion_epochs=bool(self.exclude_locomotion_epochs),
                 progress_callback=_progress_cb,
                 simulated_npz=self._simulation_npz_path(),
                 filename_suffix=self._simulation_suffix(),
+                save_output=bool(save_output),
             )
         except Exception as e:
             QMessageBox.critical(self, "Sleep scoring error", f"Error running sleep scoring:\n{e}")
@@ -1415,6 +1693,10 @@ class VideoAnalysisApp(QMainWindow):
         if not np.isfinite(self.min_sleep_state_sec) or self.min_sleep_state_sec < 0:
             self.min_sleep_state_sec = DEFAULT_MIN_SLEEP_STATE_SEC
         self.rem_only_from_nrem = bool(sleep_state.get("rem_only_from_nrem", True))
+        self.exclude_locomotion_epochs = bool(sleep_state.get("exclude_locomotion_epochs", False))
+        self.excludeLocomotionCheck.blockSignals(True)
+        self.excludeLocomotionCheck.setChecked(self.exclude_locomotion_epochs)
+        self.excludeLocomotionCheck.blockSignals(False)
         self.left_video_crop = self._coerce_crop_rect(sleep_state.get("left_video_crop"))
         self.right_video_crop = self._coerce_crop_rect(sleep_state.get("right_video_crop"))
 
@@ -1502,6 +1784,8 @@ class VideoAnalysisApp(QMainWindow):
         self.slider.setMinimum(0)
         self.slider.setMaximum(self.total_frames - 1)
         self.slider.setEnabled(True)
+        self.setSelectionStartButton.setEnabled(True)
+        self.setSelectionEndButton.setEnabled(True)
         self.playButton.setEnabled(True)
         self.stopButton.setEnabled(True)
 
@@ -1514,6 +1798,7 @@ class VideoAnalysisApp(QMainWindow):
         self.specRangeMaxSlider.setEnabled(True)
         self.locSdEdit.setEnabled(True)
         self.locomotionThresholdEdit.setEnabled(True)
+        self.excludeLocomotionCheck.setEnabled(True)
         self.emgThresholdEdit.setEnabled(True)
         self.lowFreqThresholdEdit.setEnabled(True)
         self.ratioThresholdEdit.setEnabled(True)
@@ -1549,8 +1834,10 @@ class VideoAnalysisApp(QMainWindow):
         self._rebuild_epoch_features()
         self._refresh_state_controls()
         self._update_save_button_state()
+        self._reset_plot_view_on_next_refresh = True
         self.updateFrame()
         self.plotTraces()
+        self._refresh_threshold_histogram_dialog()
 
     def _parse_band_entries(self):
         try:
@@ -1617,6 +1904,8 @@ class VideoAnalysisApp(QMainWindow):
             self._state_dirty = True
             self._update_save_button_state()
             self.rerun_classification()
+            self.plotTraces()
+            self._refresh_threshold_histogram_dialog()
 
     def _bands_changed(self, delta_band, theta_band, low_freq_max_hz):
         tol = 1e-6
@@ -1637,11 +1926,14 @@ class VideoAnalysisApp(QMainWindow):
             delta_band=delta_band,
             theta_band=theta_band,
             low_freq_max_hz=low_freq_max_hz,
+            save_output=False,
         )
         if sleep_state is None:
             return
         sleep_state_path = self._sleep_state_path()
         self._populate_from_sleep_state(sleep_state, sleep_state_path)
+        self._state_dirty = True
+        self._update_save_button_state()
         QMessageBox.information(
             self,
             "Sleep scoring",
@@ -1656,7 +1948,7 @@ class VideoAnalysisApp(QMainWindow):
             return
 
         try:
-            organise_paths.find_paths(user_id, exp_id)
+            paths.find_paths(user_id, exp_id)
         except Exception as e:
             QMessageBox.critical(self, "Path Error", f"Error resolving paths:\n{e}")
             return
@@ -1684,6 +1976,7 @@ class VideoAnalysisApp(QMainWindow):
                 locomotion_threshold=classification_settings["locomotion_threshold"],
                 min_sleep_state_sec=classification_settings["min_sleep_state_sec"],
                 rem_only_from_nrem=classification_settings["rem_only_from_nrem"],
+                exclude_locomotion_epochs=bool(self.exclude_locomotion_epochs),
                 progress_callback=progress_dialog.update_progress,
                 simulated_npz=self._simulation_npz_path(),
                 filename_suffix=self._simulation_suffix(),
@@ -1876,7 +2169,7 @@ class VideoAnalysisApp(QMainWindow):
             return
 
         dialog = VideoCropDialog(sample_frame, self)
-        if dialog.exec_() != QDialog.Accepted:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         selected = dialog.selected_rect()
         selected = self._sanitize_crop_rect(selected, sample_frame.shape)
@@ -1997,10 +2290,10 @@ class VideoAnalysisApp(QMainWindow):
                     frame_left_c.shape[1],
                     frame_left_c.shape[0],
                     frame_left_c.strides[0],
-                    QtGui.QImage.Format_RGB888,
+                    QtGui.QImage.Format.Format_RGB888,
                 ).copy()
                 pixmap_left = QtGui.QPixmap.fromImage(image_left)
-                self.leftVideoLabel.setPixmap(pixmap_left.scaled(self.leftVideoLabel.size(), Qt.KeepAspectRatio))
+                self.leftVideoLabel.setPixmap(pixmap_left.scaled(self.leftVideoLabel.size(), Qt.AspectRatioMode.KeepAspectRatio))
 
             frame_right = self.playVideoFrame(
                 idx_frame,
@@ -2015,10 +2308,10 @@ class VideoAnalysisApp(QMainWindow):
                     frame_right_c.shape[1],
                     frame_right_c.shape[0],
                     frame_right_c.strides[0],
-                    QtGui.QImage.Format_RGB888,
+                    QtGui.QImage.Format.Format_RGB888,
                 ).copy()
                 pixmap_right = QtGui.QPixmap.fromImage(image_right)
-                self.rightVideoLabel.setPixmap(pixmap_right.scaled(self.rightVideoLabel.size(), Qt.KeepAspectRatio))
+                self.rightVideoLabel.setPixmap(pixmap_right.scaled(self.rightVideoLabel.size(), Qt.AspectRatioMode.KeepAspectRatio))
 
             video_end = time.perf_counter()
             timings.append(("video_render", video_end - last))
@@ -2133,6 +2426,32 @@ class VideoAnalysisApp(QMainWindow):
     # -----------------------------
     # Span selection
     # -----------------------------
+    def _selection_plot_axes(self):
+        """Return the shared-time trace axes, excluding threshold sliders."""
+        if self._axs is None:
+            return []
+        return [ax for ax in list(self._axs) if ax is not None]
+
+    def _set_selection_endpoint_from_slider(self, is_start):
+        if not self._selection_enabled():
+            return
+        current = self._snap_time_to_epoch_edge(self._current_time())
+        if self.selection_range is None:
+            start = end = current
+        else:
+            start, end = self.selection_range
+        if is_start:
+            start = current
+        else:
+            end = current
+        self._set_selection_range(start, end, move_cursor=False)
+
+    def _set_selection_start_from_slider(self):
+        self._set_selection_endpoint_from_slider(is_start=True)
+
+    def _set_selection_end_from_slider(self):
+        self._set_selection_endpoint_from_slider(is_start=False)
+
     def _setup_span_selectors(self):
         for sp in self.span_selectors:
             try:
@@ -2198,21 +2517,18 @@ class VideoAnalysisApp(QMainWindow):
         return float(finite_edges[idx])
 
     def _create_selection_patch(self, ax, start, end):
-        if ax is None:
+        axes = self._selection_plot_axes()
+        if not axes:
             return
         self._remove_selection_patch()
-        try:
-            patch = ax.axvspan(start, end, color='yellow', alpha=0.3)
-        except Exception:
-            return
-        self.selection_patch = patch
-        self.selection_patches = [patch]
-        axis_index = None
-        try:
-            axis_index = list(self.figure.axes).index(ax)
-        except Exception:
-            axis_index = None
-        self._selection_patch_axis_index = axis_index
+        for plot_ax in axes:
+            try:
+                patch = plot_ax.axvspan(start, end, color='yellow', alpha=0.3, zorder=5)
+            except Exception:
+                continue
+            self.selection_patches.append(patch)
+        self.selection_patch = self.selection_patches[0] if self.selection_patches else None
+        self._selection_patch_axis_index = None
 
     def _remove_selection_patch(self):
         if self.selection_patches:
@@ -2230,24 +2546,17 @@ class VideoAnalysisApp(QMainWindow):
         self.selection_patch = None
         self._selection_patch_axis_index = None
 
-    def _set_selection_range(self, start, end, patch_ax=None):
+    def _set_selection_range(self, start, end, patch_ax=None, move_cursor=True):
         bounds = self._normalize_selection_bounds(start, end)
         if bounds is None:
             return
         start, end = bounds
         xlim_snapshot = self._capture_axis_xlimits()
         self.selection_range = (start, end)
-        target_ax = patch_ax
-        axes = self.figure.axes
-        if target_ax is None and self._selection_patch_axis_index is not None:
-            if 0 <= self._selection_patch_axis_index < len(axes):
-                target_ax = axes[self._selection_patch_axis_index]
-        if target_ax is None and axes:
-            target_ax = axes[0]
-        if target_ax is not None:
-            self._create_selection_patch(target_ax, start, end)
+        self._create_selection_patch(patch_ax, start, end)
         self._sync_selection_lines_to_range()
-        self._move_cursor_to_time(start)
+        if move_cursor:
+            self._move_cursor_to_time(start)
         self._restore_axis_xlimits(xlim_snapshot)
         if hasattr(self, "canvas") and self.canvas is not None:
             self.canvas.draw_idle()
@@ -2277,15 +2586,11 @@ class VideoAnalysisApp(QMainWindow):
         else:
             end = self._snap_time_to_epoch_edge(x)
             start = min(current_start, end)
-        patch_ax = None
-        axes = self.figure.axes
-        if self._selection_patch_axis_index is not None and 0 <= self._selection_patch_axis_index < len(axes):
-            patch_ax = axes[self._selection_patch_axis_index]
-        self._set_selection_range(start, end, patch_ax=patch_ax)
+        self._set_selection_range(start, end)
 
     def _setup_selection_vlines(self):
         self._remove_selection_vlines()
-        axes = self.figure.axes
+        axes = self._selection_plot_axes()
         if not axes:
             return
         if self.selection_range is not None:
@@ -2353,15 +2658,9 @@ class VideoAnalysisApp(QMainWindow):
         if self.selection_range is None:
             return
         start, end = self.selection_range
-        axes = self.figure.axes
-        target_ax = None
-        if self._selection_patch_axis_index is not None and 0 <= self._selection_patch_axis_index < len(axes):
-            target_ax = axes[self._selection_patch_axis_index]
-        elif axes:
-            target_ax = axes[0]
-        if target_ax is None:
+        if not self._selection_plot_axes():
             return
-        self._create_selection_patch(target_ax, start, end)
+        self._create_selection_patch(None, start, end)
         self._sync_selection_lines_to_range()
         if hasattr(self, "canvas") and self.canvas is not None:
             self.canvas.draw_idle()
@@ -2433,6 +2732,42 @@ class VideoAnalysisApp(QMainWindow):
             if np.any(mask):
                 means[i] = float(np.mean(x[mask]))
         return means
+
+    def _locomotion_epoch_mask(self):
+        if not getattr(self, "exclude_locomotion_epochs", False):
+            return np.zeros(np.asarray(getattr(self, "epoch_t", []), dtype=float).size, dtype=bool)
+        features = getattr(self, "epoch_features_data", None) or {}
+        return build_locomotion_epoch_mask(features, self.locomotion_threshold)
+
+    def _epoch_mask_for_times(self, times, epoch_mask):
+        times = np.asarray(times, dtype=float)
+        epoch_mask = np.asarray(epoch_mask, dtype=bool)
+        if times.size == 0 or epoch_mask.size == 0:
+            return np.zeros(times.size, dtype=bool)
+        edges = self._compute_epoch_edges(np.asarray(self.epoch_t, dtype=float))
+        if edges.size != epoch_mask.size + 1:
+            return np.zeros(times.size, dtype=bool)
+        indices = np.searchsorted(edges, times, side="right") - 1
+        indices = np.clip(indices, 0, epoch_mask.size - 1)
+        return epoch_mask[indices] & np.isfinite(times)
+
+    def _threshold_distribution_values(self, data_attr):
+        data = getattr(self, data_attr, None)
+        values = np.asarray(data, dtype=float) if data is not None else np.array([], dtype=float)
+        mask = self._locomotion_epoch_mask()
+        if mask.size == values.size and mask.size:
+            values = values.copy()
+            values[mask] = np.nan
+        return values
+
+    def _on_locomotion_mask_toggled(self, checked):
+        self.exclude_locomotion_epochs = bool(checked)
+        if not self.loaded:
+            return
+        self._state_dirty = True
+        self._update_save_button_state()
+        self.plotTraces()
+        self._refresh_threshold_histogram_dialog()
 
     def _compute_epoch_motion_mask(self):
         """
@@ -2584,6 +2919,7 @@ class VideoAnalysisApp(QMainWindow):
                 default_locomotion_threshold=float(self.locomotion_threshold),
                 min_sleep_state_sec=float(self.min_sleep_state_sec),
                 rem_only_from_nrem=bool(self.rem_only_from_nrem),
+                exclude_locomotion_epochs=bool(self.exclude_locomotion_epochs),
             )
         except Exception as exc:
             QMessageBox.critical(self, "Rescore error", f"Error during rescoring:\n{exc}")
@@ -2612,8 +2948,38 @@ class VideoAnalysisApp(QMainWindow):
         if band_values is None:
             return
         delta_band_vals, theta_band_vals, low_freq_max_hz = band_values
-        if self._bands_changed(delta_band_vals, theta_band_vals, low_freq_max_hz):
-            self._run_full_rescore_with_new_bands(delta_band_vals, theta_band_vals, low_freq_max_hz)
+        saved_state = self.loaded_sleep_state if isinstance(self.loaded_sleep_state, dict) else {}
+        saved_mask_setting = bool(saved_state.get("exclude_locomotion_epochs", False))
+        try:
+            saved_locomotion_threshold = float(
+                saved_state.get("locomotion_threshold", self.locomotion_threshold)
+            )
+        except Exception:
+            saved_locomotion_threshold = float(self.locomotion_threshold)
+        cached_features = saved_state.get("epoch_features")
+        feature_cache_needs_rebuild = not isinstance(cached_features, dict) or any(
+            key not in cached_features
+            for key in (
+                "low_freq_power_smoothed_unmasked",
+                "theta_delta_ratio_smoothed_unmasked",
+            )
+        )
+        feature_mask_changed = (
+            saved_mask_setting != bool(self.exclude_locomotion_epochs)
+            or not np.isclose(
+                saved_locomotion_threshold,
+                float(self.locomotion_threshold),
+                equal_nan=True,
+            )
+        )
+        if (
+            self._bands_changed(delta_band_vals, theta_band_vals, low_freq_max_hz)
+            or feature_mask_changed
+            or feature_cache_needs_rebuild
+        ):
+            self._run_full_rescore_with_new_bands(
+                delta_band_vals, theta_band_vals, low_freq_max_hz
+            )
         else:
             self.rerun_classification()
 
@@ -2637,6 +3003,7 @@ class VideoAnalysisApp(QMainWindow):
         sleep_state["low_freq_threshold"] = float(self.low_freq_threshold)
         sleep_state["delta_power_threshold"] = float(self.low_freq_threshold)
         sleep_state["locomotion_threshold"] = float(self.locomotion_threshold)
+        sleep_state["exclude_locomotion_epochs"] = bool(self.exclude_locomotion_epochs)
         sleep_state["min_sleep_state_sec"] = float(self.min_sleep_state_sec)
         sleep_state["rem_only_from_nrem"] = bool(self.rem_only_from_nrem)
         sleep_state["low_freq_max_hz"] = float(self.low_freq_max_hz)
@@ -2846,6 +3213,9 @@ class VideoAnalysisApp(QMainWindow):
         self._histogram_dialog.refresh()
         self._histogram_dialog.show()
         self._histogram_dialog.raise_()
+        self._histogram_dialog.activateWindow()
+        self._histogram_dialog.canvas.draw()
+        QApplication.processEvents()
 
     def _apply_threshold_from_histogram(self, metric_key, value):
         attr_map = {
@@ -2882,6 +3252,99 @@ class VideoAnalysisApp(QMainWindow):
             return
         dialog.refresh()
 
+    def apply_group_result(self, group_result, exp_ids):
+        """Apply one shared PCA result and common thresholds atomically."""
+        source_states = group_result.get("source_states", [])
+        source_paths = group_result.get("source_paths", [])
+        experiments = group_result.get("experiments", [])
+        if not (len(source_states) == len(source_paths) == len(experiments) == len(exp_ids)):
+            raise ValueError("group result is incomplete")
+
+        thresholds = {
+            "emg_rms_threshold": float(self.emg_rms_threshold),
+            "theta_ratio_threshold": float(self.theta_delta_ratio_threshold),
+            "theta_delta_ratio_threshold": float(self.theta_delta_ratio_threshold),
+            "low_freq_threshold": float(self.low_freq_threshold),
+            "delta_power_threshold": float(self.low_freq_threshold),
+            "locomotion_threshold": float(self.locomotion_threshold),
+        }
+        updated_states = []
+        temp_paths = []
+        try:
+            for exp_id, source, path, projected in zip(exp_ids, source_states, source_paths, experiments):
+                state = dict(source)
+                features = {
+                    key: np.asarray(value).copy()
+                    for key, value in dict(source["epoch_features"]).items()
+                }
+                epoch_count = np.asarray(source["epoch_t"]).size
+                for key in ("low_freq_power", "low_freq_power_smoothed", "low_freq_power_smoothed_unmasked"):
+                    value = np.asarray(projected[key], dtype=float)
+                    if value.size != epoch_count:
+                        raise ValueError(f"{exp_id}: shared feature length does not match epoch count")
+                    features[key] = value
+                state["epoch_features"] = features
+                state["low_freq_power"] = np.asarray(projected["low_freq_power"], dtype=np.float32)
+                state["low_freq_power_smoothed"] = np.asarray(projected["low_freq_power_smoothed"], dtype=np.float32)
+                state["low_freq_power_timeseries"] = np.asarray(projected["low_freq_series"], dtype=np.float32)
+                state["low_freq_power_timeseries_t"] = np.asarray(projected["low_freq_series_t"], dtype=np.float64)
+                state["low_freq_pca"] = {
+                    "frequency_bins": np.asarray(group_result["pca_frequency_bins"], dtype=np.float32),
+                    "frequency_mean": np.asarray(group_result["pca_frequency_mean"], dtype=np.float32),
+                    "frequency_std": np.asarray(group_result["pca_frequency_std"], dtype=np.float32),
+                    "weights": np.asarray(group_result["pca_weights"], dtype=np.float32),
+                    "exp_ids": list(exp_ids),
+                    "version": 1,
+                }
+                state["threshold_distribution_exp_ids"] = list(exp_ids)
+                state["threshold_distribution_mode"] = "shared_low_freq_pca"
+                state.update(thresholds)
+                state["exclude_locomotion_epochs"] = bool(self.exclude_locomotion_epochs)
+                state["min_sleep_state_sec"] = float(self.min_sleep_state_sec)
+                state["rem_only_from_nrem"] = bool(self.rem_only_from_nrem)
+                state_epoch, _ = score_from_epoch_features(
+                    features,
+                    thresholds=thresholds,
+                    auto_thresholds=False,
+                    default_locomotion_threshold=float(self.locomotion_threshold),
+                    min_sleep_state_sec=float(self.min_sleep_state_sec),
+                    rem_only_from_nrem=bool(self.rem_only_from_nrem),
+                    exclude_locomotion_epochs=bool(self.exclude_locomotion_epochs),
+                )
+                state["state_epoch"] = np.asarray(state_epoch, dtype=np.int8)
+                state["state_epoch_t"] = np.asarray(source["state_epoch_t"], dtype=np.float64)
+                interp = interp1d(
+                    state["state_epoch_t"], state["state_epoch"], kind="nearest",
+                    bounds_error=False,
+                    fill_value=(state["state_epoch"][0], state["state_epoch"][-1]),
+                )
+                state["state_10hz"] = interp(np.asarray(source["state_10hz_t"], dtype=float)).astype(np.int8)
+                state["state_10hz_t"] = np.asarray(source["state_10hz_t"], dtype=np.float64)
+                updated_states.append(state)
+
+            for path, state in zip(source_paths, updated_states):
+                directory = os.path.dirname(path)
+                fd, temp_path = tempfile.mkstemp(prefix=".sleep_state_group_", suffix=".pickle", dir=directory)
+                os.close(fd)
+                temp_paths.append(temp_path)
+                with open(temp_path, "wb") as handle:
+                    pickle.dump(state, handle)
+            for temp_path, path in zip(temp_paths, source_paths):
+                os.replace(temp_path, path)
+            temp_paths.clear()
+        finally:
+            for temp_path in temp_paths:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+        current_index = exp_ids.index(self.expID)
+        self._populate_from_sleep_state(updated_states[current_index], source_paths[current_index])
+        self._state_dirty = False
+        self._capture_saved_threshold_values()
+        self._update_save_button_state()
+
     def _update_save_button_state(self):
         if hasattr(self, "saveButton") and self.saveButton is not None:
             self.saveButton.setEnabled(self.loaded and self._state_dirty)
@@ -2891,6 +3354,9 @@ class VideoAnalysisApp(QMainWindow):
 
     def onModeToggled(self, *_):
         selection_active = self._selection_enabled()
+        if hasattr(self, "setSelectionStartButton"):
+            self.setSelectionStartButton.setEnabled(selection_active)
+            self.setSelectionEndButton.setEnabled(selection_active)
         for selector in self.span_selectors:
             try:
                 selector.set_active(selection_active)
@@ -2962,7 +3428,7 @@ class VideoAnalysisApp(QMainWindow):
             self.state_buttons.append(btn)
 
             shortcut_key = str(idx)
-            shortcut = QtWidgets.QShortcut(QtGui.QKeySequence(shortcut_key), self)
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(shortcut_key), self)
             shortcut.activated.connect(lambda sid=state_id: self.assign_state_key(sid))
             self.state_shortcuts.append(shortcut)
             self.state_shortcut_map[shortcut_key] = state_id
@@ -3320,7 +3786,11 @@ class VideoAnalysisApp(QMainWindow):
 
         # Preserve current zoom/pan limits when redrawing the figure.
         prev_limits = None
-        if isinstance(self._axs, np.ndarray) and self._axs.size >= 8:
+        if (
+            not self._reset_plot_view_on_next_refresh
+            and isinstance(self._axs, np.ndarray)
+            and self._axs.size >= 8
+        ):
             prev_limits = []
             for ax in self._axs[:8]:
                 try:
@@ -3335,10 +3805,15 @@ class VideoAnalysisApp(QMainWindow):
 
         # masking (existing behaviour)
         epoch_moving = self._compute_epoch_motion_mask()
+        locomotion_mask = self._locomotion_epoch_mask()
+        plot_epoch_mask = epoch_moving | locomotion_mask
+        eeg_time_mask = self._epoch_mask_for_times(self.eeg_10hz_t, locomotion_mask)
+        spectrogram_time_mask = self._epoch_mask_for_times(self.eeg_spectrogram_t, locomotion_mask)
         ratio_masked = np.asarray(self.theta_delta_ratio_smoothed, dtype=float)
         if ratio_masked.size > 0:
             ratio_masked = ratio_masked.copy()
-            ratio_masked[epoch_moving] = np.nan
+            if plot_epoch_mask.size == ratio_masked.size:
+                ratio_masked[plot_epoch_mask] = np.nan
         else:
             ratio_masked = np.full_like(self.epoch_t, np.nan, dtype=float)
 
@@ -3470,7 +3945,10 @@ class VideoAnalysisApp(QMainWindow):
         # 4) EEG 10 Hz
         ax3 = axs[3]
         if self._is_line_visible("eeg"):
-            ax3.plot(self.eeg_10hz_t, self.eeg_10hz)
+            eeg_display = np.asarray(self.eeg_10hz, dtype=float).copy()
+            if eeg_display.size == eeg_time_mask.size:
+                eeg_display[eeg_time_mask] = np.nan
+            ax3.plot(self.eeg_10hz_t, eeg_display)
         ax3.set_ylabel("EEG")
         ax3.spines['top'].set_visible(False)
         ax3.spines['right'].set_visible(False)
@@ -3489,7 +3967,9 @@ class VideoAnalysisApp(QMainWindow):
             band_mask = (freqs >= 0) & (freqs <= max_freq)
             if np.any(band_mask):
                 freqs_band = freqs[band_mask]
-                spec_band = spec[band_mask, :]
+                spec_band = np.asarray(spec[band_mask, :], dtype=float).copy()
+                if spec_band.shape[1] == spectrogram_time_mask.size:
+                    spec_band[:, spectrogram_time_mask] = np.nan
 
                 t0 = float(self.eeg_spectrogram_t[0])
                 t1 = float(self.eeg_spectrogram_t[-1])
@@ -3543,7 +4023,8 @@ class VideoAnalysisApp(QMainWindow):
         low_freq_vals = np.asarray(low_freq_source, dtype=float)
         if low_freq_vals.size > 0:
             lf_masked = low_freq_vals.copy()
-            lf_masked[epoch_moving] = np.nan
+            if lf_masked.size == plot_epoch_mask.size:
+                lf_masked[plot_epoch_mask] = np.nan
         else:
             lf_masked = np.full_like(self.epoch_t, np.nan, dtype=float)
         if self._is_line_visible("low_freq"):
@@ -3609,6 +4090,7 @@ class VideoAnalysisApp(QMainWindow):
                         pass
 
         self.canvas.draw()
+        self._reset_plot_view_on_next_refresh = False
 
     def _draw_state_axis(self, ax6, preserve_xlim=None):
         if preserve_xlim is not None:
@@ -3664,14 +4146,6 @@ class VideoAnalysisApp(QMainWindow):
         if self._ax_state is None:
             return
 
-        # remove any selection highlight safely
-        if self.selection_patch is not None:
-            try:
-                self.selection_patch.remove()
-            except Exception:
-                pass
-            self.selection_patch = None
-
         x_limits = None
         try:
             x_limits = self._ax_state.get_xlim()
@@ -3687,6 +4161,11 @@ class VideoAnalysisApp(QMainWindow):
         except Exception:
             pass
 
+        # Redrawing the state axis removes its old artists, including the
+        # selection overlays. Rebuild both overlay types on all trace axes.
+        self._setup_selection_vlines()
+        self._restore_selection_patch()
+
         self.canvas.draw_idle()
 
     # -----------------------------
@@ -3696,8 +4175,8 @@ if __name__ == "__main__":
     # Prefer software GL on X11 to avoid noisy GLX FBConfig/XVisual fallback warnings.
     os.environ.setdefault("QT_OPENGL", "software")
     os.environ.setdefault("QT_XCB_GL_INTEGRATION", "none")
-    QtCore.QCoreApplication.setAttribute(Qt.AA_UseSoftwareOpenGL, True)
+    QtCore.QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
     app = QApplication(sys.argv)
     win = VideoAnalysisApp()
     win.showMaximized()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())

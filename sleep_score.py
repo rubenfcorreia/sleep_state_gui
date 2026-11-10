@@ -1,3 +1,4 @@
+import sys
 import os
 import time
 import pickle
@@ -12,7 +13,16 @@ from scipy.interpolate import interp1d
 from sklearn.mixture import GaussianMixture
 from typing import Dict, Optional, Tuple
 
-import organise_paths
+from pathlib import Path
+
+try:
+    from preprocess_pipeline.shared import paths
+except ModuleNotFoundError:
+    # Allow direct execution from this standalone checkout.
+    _lab_pipeline_src = Path(__file__).resolve().parents[1] / "lab_pipeline" / "src"
+    if _lab_pipeline_src.is_dir() and str(_lab_pipeline_src) not in sys.path:
+        sys.path.insert(0, str(_lab_pipeline_src))
+    from preprocess_pipeline.shared import paths
 
 
 # ---------------------------------------------------------------------
@@ -192,6 +202,21 @@ def _adaptive_savgol(x, base_window, poly=3):
     return signal.savgol_filter(x, window_length=win, polyorder=poly, mode="nearest")
 
 
+def _adaptive_savgol_masked(x, valid_mask, base_window, poly=3):
+    values = np.asarray(x, dtype=float)
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(values)
+    output = np.full(values.shape, np.nan, dtype=float)
+    idx = np.flatnonzero(valid)
+    if idx.size == 0:
+        return output
+    run_breaks = np.flatnonzero(np.diff(idx) > 1)
+    starts = np.r_[idx[0], idx[run_breaks + 1]]
+    stops = np.r_[idx[run_breaks] + 1, idx[-1] + 1]
+    for start, stop in zip(starts, stops):
+        output[start:stop] = _adaptive_savgol(values[start:stop], base_window, poly)
+    return output
+
+
 def _epoch_edges_from_centers(epoch_centers):
     et = np.asarray(epoch_centers, dtype=float)
     if et.size == 0:
@@ -258,6 +283,135 @@ def _first_principal_component(matrix):
         scores = u[:, 0] * s[0]
         loadings = vt[0]
     return scores, loadings
+
+
+def _load_group_ephys(user_id, exp_id, simulated_npz=None):
+    """Load the EEG, time, and wheel signals needed for group PCA."""
+    _, _, _, exp_dir_processed, _ = paths.find_paths(user_id, exp_id)
+    if simulated_npz is not None:
+        with np.load(simulated_npz) as sim_data:
+            eeg = np.asarray(sim_data["eeg"], dtype=float)
+            fs = float(sim_data.get("fs", sim_data.get("fs_original", FS_EPHYS)))
+        if eeg.size == 0:
+            raise ValueError("simulated EEG is empty")
+        t = np.arange(eeg.size, dtype=float) / fs
+        return exp_dir_processed, eeg, t, np.zeros(eeg.size, dtype=float), fs
+
+    recordings_dir = os.path.join(exp_dir_processed, "recordings")
+    ephys_path = os.path.join(recordings_dir, "ephys.npy")
+    wheel_path = os.path.join(recordings_dir, "wheel.pickle")
+    if not os.path.isfile(ephys_path) or not os.path.isfile(wheel_path):
+        raise FileNotFoundError(f"{exp_id}: required recordings are missing")
+    with open(ephys_path, "rb") as handle:
+        all_ephys = np.load(handle)
+    with open(wheel_path, "rb") as handle:
+        wheel_df = pd.read_pickle(handle)
+    if np.asarray(all_ephys).ndim != 2 or all_ephys.shape[0] < 3:
+        raise ValueError(f"{exp_id}: ephys.npy must contain time, EEG, and EMG rows")
+    t = np.asarray(all_ephys[0], dtype=float)
+    eeg = np.asarray(all_ephys[1], dtype=float)
+    wheel = np.interp(t, np.asarray(wheel_df["t"], dtype=float), np.asarray(wheel_df["speed"], dtype=float))
+    return exp_dir_processed, eeg, t, wheel, float(FS_EPHYS)
+
+
+def compute_shared_low_freq_pca_group(
+    user_id,
+    exp_ids,
+    *,
+    low_freq_max_hz=DEFAULT_LOW_FREQ_MAX_HZ,
+    locomotion_threshold=DEFAULT_LOCOMOTION_THRESHOLD,
+    exclude_locomotion_epochs=False,
+    simulated_npz=None,
+    progress_callback=None,
+):
+    """Fit one low-frequency PCA basis and project each experiment in a group."""
+    exp_ids = list(exp_ids)
+    if not exp_ids:
+        raise ValueError("at least one experiment is required")
+    low_freq_max_hz = min(float(low_freq_max_hz), float(np.nanmax(LOG_SPEC_FREQ_BINS)))
+    if low_freq_max_hz <= 0 or not np.isfinite(low_freq_max_hz):
+        raise ValueError("low_freq_max_hz must be positive and finite")
+
+    records = []
+    pca_inputs = []
+    total = max(1, len(exp_ids))
+    for index, exp_id in enumerate(exp_ids):
+        _report_progress(progress_callback, 0.25 * index / total, 1, f"Preparing shared PCA input: {exp_id}")
+        exp_dir, eeg_raw, t_ephys, wheel_speed, fs = _load_group_ephys(user_id, exp_id, simulated_npz=simulated_npz)
+        eeg_filtered, _ = apply_eeg_emg_filters(eeg_raw, np.zeros_like(eeg_raw), fs)
+        epoch_len = int(EPOCH_LEN_SEC * fs)
+        epoch_count = len(eeg_filtered) // epoch_len
+        if epoch_count < 1:
+            raise ValueError(f"{exp_id}: recording is too short for one epoch")
+        wheel_epochs = wheel_speed[: epoch_count * epoch_len].reshape(epoch_count, epoch_len)
+        locomotion_mask = build_locomotion_epoch_mask({"wheel_speed_mean": np.nanmean(wheel_epochs, axis=1)}, locomotion_threshold)
+        epoch_edges = t_ephys[0] + np.arange(epoch_count + 1, dtype=float) * EPOCH_LEN_SEC
+        nperseg = int(LOG_SPEC_WINDOW_SEC * fs)
+        step = int(LOG_SPEC_STEP_SEC * fs)
+        freqs, rel_t, sxx = signal.spectrogram(
+            eeg_filtered, fs=fs, window="hann", nperseg=nperseg,
+            noverlap=nperseg - step, scaling="density", mode="psd",
+        )
+        log_t = t_ephys[0] + rel_t
+        log_db = np.log10(_resample_spectrogram(freqs, sxx, LOG_SPEC_FREQ_BINS) + 1e-12)
+        epoch_indices = np.searchsorted(epoch_edges, log_t, side="right") - 1
+        valid_epoch_indices = (epoch_indices >= 0) & (epoch_indices < epoch_count)
+        pca_mask = np.zeros(log_t.size, dtype=bool)
+        if exclude_locomotion_epochs:
+            pca_mask[valid_epoch_indices] = locomotion_mask[epoch_indices[valid_epoch_indices]]
+        valid_columns = ~pca_mask & np.all(np.isfinite(log_db), axis=0)
+        if not np.any(valid_columns):
+            raise ValueError(f"{exp_id}: no valid spectrogram columns for shared PCA")
+        pca_inputs.append(log_db[:, valid_columns])
+        records.append({
+            "exp_id": exp_id, "exp_dir_processed": exp_dir, "log_t": log_t,
+            "log_db": log_db, "pca_mask": pca_mask,
+            "epoch_t": t_ephys[0] + (np.arange(epoch_count) + 0.5) * EPOCH_LEN_SEC,
+            "locomotion_mask": locomotion_mask,
+        })
+
+    combined = np.concatenate(pca_inputs, axis=1)
+    low_mask = LOG_SPEC_FREQ_BINS <= low_freq_max_hz
+    freq_mean = np.nanmean(combined, axis=1, keepdims=True)
+    freq_std = np.nanstd(combined, axis=1, keepdims=True)
+    freq_std[~np.isfinite(freq_std) | (freq_std <= 0)] = 1.0
+    _, weights = _first_principal_component(
+        (combined[low_mask] - freq_mean[low_mask]) / freq_std[low_mask]
+    )
+    if weights.size == 0:
+        raise ValueError("shared PCA produced no weights")
+    if np.nansum(weights) < 0:
+        weights = -weights
+
+    projected = []
+    all_epoch_values = []
+    for index, record in enumerate(records):
+        z = (record["log_db"] - freq_mean) / freq_std
+        low_series = z[low_mask].T @ weights
+        low_series[record["pca_mask"]] = np.nan
+        low_by_epoch = _epoch_mean_from_timeseries(record["log_t"], low_series, record["epoch_t"])
+        smoothed_unmasked = _adaptive_savgol(low_by_epoch, SAVGOL_BASE_WIN)
+        smoothed = (_adaptive_savgol_masked(low_by_epoch, ~record["locomotion_mask"], SAVGOL_BASE_WIN)
+                    if exclude_locomotion_epochs else smoothed_unmasked)
+        record.update({
+            "low_freq_series": low_series, "low_freq_series_t": record["log_t"],
+            "low_freq_power": low_by_epoch,
+            "low_freq_power_smoothed": smoothed,
+            "low_freq_power_smoothed_unmasked": smoothed_unmasked,
+        })
+        projected.append(record)
+        all_epoch_values.append(smoothed)
+        _report_progress(progress_callback, 0.25 + 0.75 * (index + 1) / total, 1, f"Projecting shared PCA features: {record['exp_id']}")
+
+    return {
+        "pca_frequency_bins": np.asarray(LOG_SPEC_FREQ_BINS[low_mask], dtype=float),
+        "pca_frequency_mean": np.asarray(freq_mean[low_mask, 0], dtype=float),
+        "pca_frequency_std": np.asarray(freq_std[low_mask, 0], dtype=float),
+        "pca_weights": np.asarray(weights, dtype=float),
+        "low_freq_max_hz": float(low_freq_max_hz), "exp_ids": exp_ids,
+        "experiments": projected,
+        "pooled_low_freq_power_smoothed": np.concatenate(all_epoch_values),
+    }
 
 
 def _band_power_ratio(spectrogram, freqs, low_band, high_band):
@@ -535,29 +689,66 @@ def build_epoch_feature_dict(
     }
 
 
+def build_locomotion_epoch_mask(epoch_features: Dict, locomotion_threshold: float) -> np.ndarray:
+    """Return epochs whose wheel-speed feature exceeds the threshold."""
+    emg_values = _as_float_array(epoch_features.get("emg_rms_mean", []))
+    wheel_values = _as_float_array(epoch_features.get("wheel_speed_mean", []))
+    n_epochs = emg_values.size if emg_values.size else wheel_values.size
+    mask = np.zeros(n_epochs, dtype=bool)
+    if wheel_values.size != n_epochs:
+        return mask
+    try:
+        threshold = float(locomotion_threshold)
+    except Exception:
+        return mask
+    if not np.isfinite(threshold):
+        return mask
+    finite = np.isfinite(wheel_values)
+    mask[finite] = wheel_values[finite] > threshold
+    return mask
+
+
 def estimate_thresholds_from_epoch_features(
     epoch_features: Dict,
     default_locomotion_threshold: float = DEFAULT_LOCOMOTION_THRESHOLD,
+    exclude_locomotion_epochs: bool = False,
 ) -> Dict[str, float]:
     """
     Estimate thresholds using trough detection on the available epoch metrics.
     """
 
-    def _resolve(arr):
+    locomotion_mask = build_locomotion_epoch_mask(
+        epoch_features, default_locomotion_threshold
+    ) if exclude_locomotion_epochs else None
+
+    def _resolve(arr, unmasked_fallback=None):
         arr_vals = _as_float_array(arr)
+        filtered_has_values = False
+        if locomotion_mask is not None and locomotion_mask.size == arr_vals.size:
+            filtered_vals = arr_vals[~locomotion_mask]
+            if np.any(np.isfinite(filtered_vals)):
+                arr_vals = filtered_vals
+                filtered_has_values = True
+        if not filtered_has_values and unmasked_fallback is not None:
+            fallback_vals = _as_float_array(unmasked_fallback)
+            if np.any(np.isfinite(fallback_vals)):
+                arr_vals = fallback_vals
         thr = _trough_of_bimodal_distribution(arr_vals)
         if np.isfinite(thr):
             return thr
         if arr_vals.size == 0:
             return float(np.nan)
-        return float(np.nanmedian(arr_vals))
+        finite_vals = arr_vals[np.isfinite(arr_vals)]
+        return float(np.nanmedian(finite_vals)) if finite_vals.size else float(np.nan)
 
     low_freq = epoch_features.get("low_freq_power_smoothed", epoch_features.get("low_freq_power", []))
+    low_freq_unmasked = epoch_features.get("low_freq_power_smoothed_unmasked")
     theta_ratio = epoch_features.get("theta_delta_ratio_smoothed", epoch_features.get("theta_ratio_smoothed", []))
+    theta_ratio_unmasked = epoch_features.get("theta_delta_ratio_smoothed_unmasked")
     emg_vals = epoch_features.get("emg_rms_mean", [])
     return {
-        "low_freq_threshold": _resolve(low_freq),
-        "theta_ratio_threshold": _resolve(theta_ratio),
+        "low_freq_threshold": _resolve(low_freq, low_freq_unmasked),
+        "theta_ratio_threshold": _resolve(theta_ratio, theta_ratio_unmasked),
         "emg_rms_threshold": _resolve(emg_vals),
         "locomotion_threshold": float(default_locomotion_threshold),
     }
@@ -644,6 +835,7 @@ def score_from_epoch_features(
     default_locomotion_threshold: float = DEFAULT_LOCOMOTION_THRESHOLD,
     min_sleep_state_sec: float = DEFAULT_MIN_SLEEP_STATE_SEC,
     rem_only_from_nrem: bool = True,
+    exclude_locomotion_epochs: bool = False,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
     Classify sleep states given epoch-level summary data.
@@ -687,6 +879,7 @@ def score_from_epoch_features(
     auto_vals = estimate_thresholds_from_epoch_features(
         epoch_features,
         default_locomotion_threshold=default_locomotion_threshold,
+        exclude_locomotion_epochs=exclude_locomotion_epochs,
     )
 
     if auto_thresholds or thresholds is None:
@@ -869,10 +1062,12 @@ def run_sleep_scoring(
     low_freq_max_hz=DEFAULT_LOW_FREQ_MAX_HZ,
     locomotion_threshold=DEFAULT_LOCOMOTION_THRESHOLD,
     min_sleep_state_sec=DEFAULT_MIN_SLEEP_STATE_SEC,
+    exclude_locomotion_epochs=False,
     rem_only_from_nrem=True,
     progress_callback=None,
     simulated_npz=None,
     filename_suffix="",
+    save_output=True,
 ):
     """
     Sleep scoring pipeline.
@@ -928,7 +1123,7 @@ def run_sleep_scoring(
     step_idx += 1
     _report_progress(progress_callback, step_idx, total_steps, "Locating paths and loading data")
     print("[1/9] locating paths and loading data")
-    animal_id, _, _, exp_dir_processed, _ = organise_paths.find_paths(user_id, exp_id)
+    animal_id, _, _, exp_dir_processed, _ = paths.find_paths(user_id, exp_id)
 
     sleep_score_folder = ensure_dir(os.path.join(exp_dir_processed, "sleep_score"))
     figs_folder = ensure_dir(os.path.join(sleep_score_folder, "figs"))
@@ -990,7 +1185,44 @@ def run_sleep_scoring(
     emg_rms_full = emg_rms.copy()  # save full-length RMS for plotting
 
     # -------------------------------------------------------------
-    # 4. log-spaced spectrogram (10 s window, 1 s stride)
+    # 4. resample wheel speed before EEG-derived feature extraction
+    # -------------------------------------------------------------
+    if simulated:
+        print("  - using simulated wheel speed (zeros)")
+        wheel_speed_full = np.zeros_like(t_ephys, dtype=float)
+        wheel_speed_resampled = wheel_speed_full.copy()
+    else:
+        print("  - resampling wheel speed to ephys time base")
+        wheel_speed_raw = wheel_df["speed"]
+        wheel_t = wheel_df["t"]
+        wheel_speed_resampled = np.interp(t_ephys, wheel_t, wheel_speed_raw)
+        wheel_speed_full = wheel_speed_resampled.copy()
+
+    preliminary_n_epochs = len(eeg_filtered) // EPOCH_LEN_SAMPLES
+    preliminary_samples = preliminary_n_epochs * EPOCH_LEN_SAMPLES
+    preliminary_wheel = wheel_speed_resampled[:preliminary_samples]
+    if preliminary_n_epochs > 0:
+        preliminary_wheel_epochs = preliminary_wheel.reshape(
+            preliminary_n_epochs, EPOCH_LEN_SAMPLES
+        )
+        preliminary_wheel_mean = np.nanmean(preliminary_wheel_epochs, axis=1)
+        locomotion_epoch_mask = (
+            build_locomotion_epoch_mask(
+                {"wheel_speed_mean": preliminary_wheel_mean},
+                locomotion_threshold,
+            )
+            if exclude_locomotion_epochs
+            else np.zeros(preliminary_n_epochs, dtype=bool)
+        )
+        preliminary_epoch_edges = t_ephys[0] + np.arange(
+            preliminary_n_epochs + 1, dtype=float
+        ) * EPOCH_LEN_SEC
+    else:
+        locomotion_epoch_mask = np.zeros(0, dtype=bool)
+        preliminary_epoch_edges = np.array([], dtype=float)
+
+    # -------------------------------------------------------------
+    # 5. log-spaced spectrogram (10 s window, 1 s stride)
     # -------------------------------------------------------------
     step_idx += 1
     _report_progress(progress_callback, step_idx, total_steps, "Computing log-frequency spectrogram")
@@ -1015,16 +1247,41 @@ def run_sleep_scoring(
     log_t_abs = t_ephys[0] + log_rel_t
     log_sxx_resampled = _resample_spectrogram(log_freqs, log_sxx, LOG_SPEC_FREQ_BINS)
     log_sxx_db = np.log10(log_sxx_resampled + 1e-12)
-    freq_mean = np.nanmean(log_sxx_db, axis=1, keepdims=True)
-    freq_std = np.nanstd(log_sxx_db, axis=1, keepdims=True)
+    pca_bin_mask = np.zeros(log_t_abs.size, dtype=bool)
+    if locomotion_epoch_mask.size and preliminary_epoch_edges.size:
+        epoch_indices = np.searchsorted(
+            preliminary_epoch_edges, log_t_abs, side="right"
+        ) - 1
+        valid_indices = (
+            (epoch_indices >= 0)
+            & (epoch_indices < locomotion_epoch_mask.size)
+        )
+        pca_bin_mask[valid_indices] = locomotion_epoch_mask[epoch_indices[valid_indices]]
+
+    pca_columns = ~pca_bin_mask
+    normalization_source = (
+        log_sxx_db[:, pca_columns]
+        if exclude_locomotion_epochs and np.any(pca_columns)
+        else log_sxx_db
+    )
+    freq_mean = np.nanmean(normalization_source, axis=1, keepdims=True)
+    freq_std = np.nanstd(normalization_source, axis=1, keepdims=True)
     freq_std[~np.isfinite(freq_std) | (freq_std <= 0)] = 1.0
     log_sxx_z = (log_sxx_db - freq_mean) / freq_std
     low_freq_mask = LOG_SPEC_FREQ_BINS <= low_freq_max_hz
     if np.count_nonzero(low_freq_mask) >= 2:
         low_freq_input = log_sxx_z[low_freq_mask, :]
-        low_freq_series, low_freq_weights = _first_principal_component(low_freq_input)
+        valid_pca_columns = pca_columns & np.all(np.isfinite(low_freq_input), axis=0)
+        if exclude_locomotion_epochs and np.any(valid_pca_columns):
+            _, low_freq_weights = _first_principal_component(
+                low_freq_input[:, valid_pca_columns]
+            )
+            low_freq_series = low_freq_input.T @ low_freq_weights
+            low_freq_series[pca_bin_mask] = np.nan
+        else:
+            low_freq_series, low_freq_weights = _first_principal_component(low_freq_input)
     else:
-        # Fallback for degenerate masks; keep prior behavior on full spectrum.
+        # Fallback for degenerate frequency masks; retain prior full-spectrum behavior.
         low_freq_series, low_freq_weights = _first_principal_component(log_sxx_z)
     if np.isfinite(np.nansum(low_freq_weights)):
         if np.nansum(low_freq_weights) < 0:
@@ -1074,23 +1331,6 @@ def run_sleep_scoring(
     spec_t_abs = t_ephys[0] + spec_t_rel
 
     # -------------------------------------------------------------
-    # 6. resample wheel speed to ephys time base
-    # -------------------------------------------------------------
-    step_idx += 1
-    wheel_step_msg = "Using simulated wheel speed (zeros)" if simulated else "Resampling wheel speed"
-    _report_progress(progress_callback, step_idx, total_steps, wheel_step_msg)
-    if simulated:
-        print("[7/14] using simulated wheel speed (zeros)")
-        wheel_speed_full = np.zeros_like(t_ephys, dtype=float)
-        wheel_speed_resampled = wheel_speed_full.copy()
-    else:
-        print("[7/14] resampling wheel speed to ephys time base")
-        wheel_speed_raw = wheel_df["speed"]
-        wheel_t = wheel_df["t"]
-        wheel_speed_resampled = np.interp(t_ephys, wheel_t, wheel_speed_raw)
-        wheel_speed_full = wheel_speed_resampled.copy()  # for plotting
-
-    # -------------------------------------------------------------
     # 7. epoching (10 s epochs) and epoch-level features
     # -------------------------------------------------------------
     step_idx += 1
@@ -1123,13 +1363,60 @@ def run_sleep_scoring(
     print("[9/14] computing epoch-wise power features")
     theta_power_epochs = epoch_total_power(eeg_theta_epochs, fs)
     delta_power_epochs = epoch_total_power(eeg_delta_epochs, fs)
+    theta_power_epochs_unmasked = theta_power_epochs.copy()
+    delta_power_epochs_unmasked = delta_power_epochs.copy()
+    theta_delta_ratio_unmasked = (
+        theta_power_epochs_unmasked / delta_power_epochs_unmasked
+    )
+    theta_delta_ratio_unmasked[~np.isfinite(theta_delta_ratio_unmasked)] = np.nan
+    delta_power_smoothed_unmasked = _adaptive_savgol(
+        delta_power_epochs_unmasked, SAVGOL_BASE_WIN
+    )
+    theta_delta_ratio_smoothed_unmasked = _adaptive_savgol(
+        theta_delta_ratio_unmasked, SAVGOL_BASE_WIN
+    )
+    feature_valid_mask = np.ones(n_epochs, dtype=bool)
+    if exclude_locomotion_epochs and locomotion_epoch_mask.size == n_epochs:
+        feature_valid_mask = ~locomotion_epoch_mask
+        theta_power_epochs = theta_power_epochs.copy()
+        delta_power_epochs = delta_power_epochs.copy()
+        theta_power_epochs[~feature_valid_mask] = np.nan
+        delta_power_epochs[~feature_valid_mask] = np.nan
 
-    delta_power_smoothed = _adaptive_savgol(delta_power_epochs, SAVGOL_BASE_WIN)
+    if exclude_locomotion_epochs:
+        delta_power_smoothed = _adaptive_savgol_masked(
+            delta_power_epochs, feature_valid_mask, SAVGOL_BASE_WIN
+        )
+    else:
+        delta_power_smoothed = _adaptive_savgol(delta_power_epochs, SAVGOL_BASE_WIN)
+
     theta_delta_ratio = theta_power_epochs / delta_power_epochs
-    theta_delta_ratio_smoothed = _adaptive_savgol(theta_delta_ratio, SAVGOL_BASE_WIN)
+    theta_delta_ratio[~feature_valid_mask] = np.nan
+    if exclude_locomotion_epochs:
+        theta_delta_ratio_smoothed = _adaptive_savgol_masked(
+            theta_delta_ratio, feature_valid_mask, SAVGOL_BASE_WIN
+        )
+    else:
+        theta_delta_ratio_smoothed = _adaptive_savgol(
+            theta_delta_ratio, SAVGOL_BASE_WIN
+        )
 
     low_freq_by_epoch = _epoch_mean_from_timeseries(log_t_abs, low_freq_series, epoch_time)
+    low_freq_power_smoothed_unmasked = _adaptive_savgol(
+        low_freq_by_epoch, SAVGOL_BASE_WIN
+    )
     theta_ratio_by_epoch = _epoch_mean_from_timeseries(log_t_abs, theta_ratio_series, epoch_time)
+    if exclude_locomotion_epochs:
+        low_freq_power_smoothed = _adaptive_savgol_masked(
+            low_freq_by_epoch,
+            ~locomotion_epoch_mask,
+            SAVGOL_BASE_WIN,
+        )
+    else:
+        low_freq_power_smoothed = _adaptive_savgol(
+            low_freq_by_epoch,
+            SAVGOL_BASE_WIN,
+        )
 
     # -------------------------------------------------------------
     # 8. thresholds and state classification
@@ -1150,7 +1437,14 @@ def run_sleep_scoring(
         theta_delta_ratio_smoothed=theta_delta_ratio_smoothed,
         delta_power_smoothed=delta_power_smoothed,
         low_freq_power=low_freq_by_epoch,
+        low_freq_power_smoothed=low_freq_power_smoothed,
         theta_ratio=theta_ratio_by_epoch,
+    )
+    epoch_features["low_freq_power_smoothed_unmasked"] = (
+        low_freq_power_smoothed_unmasked
+    )
+    epoch_features["theta_delta_ratio_smoothed_unmasked"] = (
+        theta_delta_ratio_smoothed_unmasked
     )
 
     sleep_state_epoch, thresholds_used = score_from_epoch_features(
@@ -1158,6 +1452,7 @@ def run_sleep_scoring(
         auto_thresholds=True,
         default_locomotion_threshold=locomotion_threshold,
         min_sleep_state_sec=min_sleep_state_sec,
+        exclude_locomotion_epochs=exclude_locomotion_epochs,
         rem_only_from_nrem=rem_only_from_nrem,
     )
 
@@ -1270,6 +1565,7 @@ def run_sleep_scoring(
         "low_freq_threshold": float(low_freq_thr),
         "delta_power_threshold": float(low_freq_thr),
         "locomotion_threshold": float(locomotion_thr),
+        "exclude_locomotion_epochs": bool(exclude_locomotion_epochs),
         "min_sleep_state_sec": float(min_sleep_state_sec),
         "rem_only_from_nrem": bool(rem_only_from_nrem),
 
@@ -1283,17 +1579,18 @@ def run_sleep_scoring(
         "low_freq_max_hz": float(low_freq_max_hz),
     }
 
-    step_idx += 1
-    _report_progress(progress_callback, step_idx, total_steps, "Saving outputs")
-    print("saving outputs")
     sleep_state_path = os.path.join(sleep_score_folder, f"sleep_state{suffix}.pickle")
-    with open(sleep_state_path, "wb") as f:
-        pickle.dump(sleep_state, f)
+    if save_output:
+        step_idx += 1
+        _report_progress(progress_callback, step_idx, total_steps, "Saving outputs")
+        print("saving outputs")
+        with open(sleep_state_path, "wb") as f:
+            pickle.dump(sleep_state, f)
 
     # -------------------------------------------------------------
     # 11. QC figures (single call)
     # -------------------------------------------------------------
-    if MAKE_QC_FIGS:
+    if save_output and MAKE_QC_FIGS:
         print("creating QC figures")
         make_qc_figures(
             t_ephys=t_ephys,
@@ -1315,7 +1612,8 @@ def run_sleep_scoring(
     duration = time.time() - start_time
     _report_progress(progress_callback, total_steps, total_steps, "Sleep scoring complete")
     print(f"done. scoring complete in {duration:.2f} s")
-    print(f"  sleep_state: {sleep_state_path}")
+    if save_output:
+        print(f"  sleep_state: {sleep_state_path}")
 
     return sleep_state
 
