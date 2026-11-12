@@ -1,6 +1,6 @@
 # Sleep State GUI and Scoring
 
-PyQt5 GUI plus offline scorer for mouse sleep/wake states.
+PyQt6 GUI plus offline scorer for mouse sleep/wake states.
 
 - GUI: `sleep_state_gui.py`
 - Scoring pipeline: `sleep_score.py`
@@ -15,7 +15,7 @@ Use Python 3.9+ and install:
 - `matplotlib`
 - `scikit-learn`
 - `opencv-python`
-- `PyQt5`
+- `PyQt6`
 
 The code expects your data paths to be resolved by `organise_paths.find_paths(user_id, exp_id)`.
 
@@ -104,6 +104,16 @@ python sleep_state_gui.py
 - Global **Revert thresholds** button.
 - Slider ranges auto-expand if you manually enter out-of-range values.
 
+### Exclusion modes
+
+The GUI provides two mutually exclusive exclusion modes:
+
+- Neither option selected: normal classification, PCA, threshold estimation, and plotting.
+- **Exclude locomotion epochs**: excludes locomotion epochs from EEG-derived threshold/PCA distributions.
+- **Exclude broadband artifact epochs**: detects unusually high broadband power in either EEG or EMG and excludes those 10 s epochs from PCA, automatic thresholds, and relevant plots.
+
+Selecting one option automatically clears the other. In broadband-artifact mode, an artifact epoch with locomotion is classified as **Active wake** (`0`); an artifact epoch without locomotion is **Unassigned** (`-1`). The same mode is available in the combined-`expIDs` threshold window and is applied per experiment before pooling. Spectrogram display saturation is a separate visualization control.
+
 ### Band configuration
 
 - Editable scoring bands:
@@ -122,9 +132,11 @@ Per 10 s epoch (`score_from_epoch_features`), states are assigned in this order:
 4. Else if EMG >= `emg_rms_threshold` -> **Active wake** (`0`)
 5. Else -> **Quiet wake** (`1`)
 
+When broadband-artifact exclusion is enabled, artifact labels override the normal result after this classification: locomotion artifacts become Active wake (`0`), and non-locomotion artifacts become Unassigned (`-1`).
+
 Defaults include:
 
-- `locomotion_threshold = 0.1`
+- `locomotion_threshold = 0.05`
 - `theta_ratio_threshold` auto-estimated when scoring
 - `low_freq_max_hz = 20.0`
 
@@ -141,6 +153,9 @@ Saved as a Python pickle dictionary:
 
 - `state_epoch`, `state_epoch_t`: classified state per 10 s epoch and epoch center times.
 - `state_10hz`, `state_10hz_t`: nearest-neighbor interpolated state timeline at 10 Hz.
+- `state_labels`: numeric state labels, including `-1` for unassigned artifact periods.
+- `broadband_artifact_mask`: boolean artifact mask at 10 s epoch resolution.
+- `exclude_locomotion_epochs`, `exclude_broadband_artifacts`: persisted exclusion-mode settings.
 - Thresholds:
   - `emg_rms_threshold`
   - `theta_ratio_threshold` (also mirrored as `theta_delta_ratio_threshold`)
@@ -176,10 +191,15 @@ sleep_state = run_sleep_scoring(
     low_freq_max_hz=20.0,
     simulated_npz=None,     # or path to sample_data/*.npz
     filename_suffix="",    # use "_sim" for simulated
+    exclude_locomotion_epochs=False,
+    exclude_broadband_artifacts=False,
 )
 ```
 
 ## Notes
 
 - `state_epoch_t` / `state_10hz_t` are in experiment timeline seconds and align plotting/state assignment to timeline time.
+- State arrays use `int8`; unassigned is represented by `-1`, not `999`.
+- Broadband artifact detection is recording-relative and can flag an artifact in either EEG or EMG.
+- `2026-11-02_02_ESRC039` is an artifact-containing validation recording; `2026-01-14_03_ESRC023` is a clean control.
 - `sleep_score/face_motion.npy` is used as a cache for computed face-motion data when available.

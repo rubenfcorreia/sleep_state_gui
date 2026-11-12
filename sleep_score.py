@@ -69,8 +69,10 @@ STATE_ACTIVE_WAKE = 0
 STATE_QUIET_WAKE = 1
 STATE_NREM = 2
 STATE_REM = 3
+STATE_UNASSIGNED = -1
 
 STATE_LABELS = {
+    STATE_UNASSIGNED: "unassigned",
     STATE_ACTIVE_WAKE: "active wake",
     STATE_QUIET_WAKE: "quiet wake",
     STATE_NREM: "nrem",
@@ -82,6 +84,7 @@ DEFAULT_THETA_BAND = (5.0, 10.0)
 DEFAULT_LOW_FREQ_MAX_HZ = 20.0
 DEFAULT_LOCOMOTION_THRESHOLD = 0.05
 DEFAULT_MIN_SLEEP_STATE_SEC = 20.0
+BROADBAND_ARTIFACT_ROBUST_Z = 12.0
 
 
 # ---------------------------------------------------------------------
@@ -295,7 +298,7 @@ def _load_group_ephys(user_id, exp_id, simulated_npz=None):
         if eeg.size == 0:
             raise ValueError("simulated EEG is empty")
         t = np.arange(eeg.size, dtype=float) / fs
-        return exp_dir_processed, eeg, t, np.zeros(eeg.size, dtype=float), fs
+        return exp_dir_processed, eeg, np.zeros_like(eeg), t, np.zeros(eeg.size, dtype=float), fs
 
     recordings_dir = os.path.join(exp_dir_processed, "recordings")
     ephys_path = os.path.join(recordings_dir, "ephys.npy")
@@ -310,8 +313,9 @@ def _load_group_ephys(user_id, exp_id, simulated_npz=None):
         raise ValueError(f"{exp_id}: ephys.npy must contain time, EEG, and EMG rows")
     t = np.asarray(all_ephys[0], dtype=float)
     eeg = np.asarray(all_ephys[1], dtype=float)
+    emg = np.asarray(all_ephys[2], dtype=float)
     wheel = np.interp(t, np.asarray(wheel_df["t"], dtype=float), np.asarray(wheel_df["speed"], dtype=float))
-    return exp_dir_processed, eeg, t, wheel, float(FS_EPHYS)
+    return exp_dir_processed, eeg, emg, t, wheel, float(FS_EPHYS)
 
 
 def compute_shared_low_freq_pca_group(
@@ -321,6 +325,7 @@ def compute_shared_low_freq_pca_group(
     low_freq_max_hz=DEFAULT_LOW_FREQ_MAX_HZ,
     locomotion_threshold=DEFAULT_LOCOMOTION_THRESHOLD,
     exclude_locomotion_epochs=False,
+    exclude_broadband_artifacts=False,
     simulated_npz=None,
     progress_callback=None,
 ):
@@ -337,14 +342,16 @@ def compute_shared_low_freq_pca_group(
     total = max(1, len(exp_ids))
     for index, exp_id in enumerate(exp_ids):
         _report_progress(progress_callback, 0.25 * index / total, 1, f"Preparing shared PCA input: {exp_id}")
-        exp_dir, eeg_raw, t_ephys, wheel_speed, fs = _load_group_ephys(user_id, exp_id, simulated_npz=simulated_npz)
-        eeg_filtered, _ = apply_eeg_emg_filters(eeg_raw, np.zeros_like(eeg_raw), fs)
+        exp_dir, eeg_raw, emg_raw, t_ephys, wheel_speed, fs = _load_group_ephys(user_id, exp_id, simulated_npz=simulated_npz)
+        eeg_filtered, emg_filtered = apply_eeg_emg_filters(eeg_raw, emg_raw, fs)
         epoch_len = int(EPOCH_LEN_SEC * fs)
         epoch_count = len(eeg_filtered) // epoch_len
         if epoch_count < 1:
             raise ValueError(f"{exp_id}: recording is too short for one epoch")
         wheel_epochs = wheel_speed[: epoch_count * epoch_len].reshape(epoch_count, epoch_len)
-        locomotion_mask = build_locomotion_epoch_mask({"wheel_speed_mean": np.nanmean(wheel_epochs, axis=1)}, locomotion_threshold)
+        locomotion_mask = build_locomotion_epoch_mask({"emg_rms_mean": np.zeros(epoch_count), "wheel_speed_mean": np.nanmean(wheel_epochs, axis=1)}, locomotion_threshold)
+        artifact_mask = detect_broadband_artifact_epoch_mask(eeg_filtered, emg_filtered, epoch_len_samples=epoch_len)
+        selected_mask = locomotion_mask if exclude_locomotion_epochs else artifact_mask if exclude_broadband_artifacts else np.zeros(epoch_count, dtype=bool)
         epoch_edges = t_ephys[0] + np.arange(epoch_count + 1, dtype=float) * EPOCH_LEN_SEC
         nperseg = int(LOG_SPEC_WINDOW_SEC * fs)
         step = int(LOG_SPEC_STEP_SEC * fs)
@@ -357,8 +364,8 @@ def compute_shared_low_freq_pca_group(
         epoch_indices = np.searchsorted(epoch_edges, log_t, side="right") - 1
         valid_epoch_indices = (epoch_indices >= 0) & (epoch_indices < epoch_count)
         pca_mask = np.zeros(log_t.size, dtype=bool)
-        if exclude_locomotion_epochs:
-            pca_mask[valid_epoch_indices] = locomotion_mask[epoch_indices[valid_epoch_indices]]
+        if exclude_locomotion_epochs or exclude_broadband_artifacts:
+            pca_mask[valid_epoch_indices] = selected_mask[epoch_indices[valid_epoch_indices]]
         valid_columns = ~pca_mask & np.all(np.isfinite(log_db), axis=0)
         if not np.any(valid_columns):
             raise ValueError(f"{exp_id}: no valid spectrogram columns for shared PCA")
@@ -368,6 +375,8 @@ def compute_shared_low_freq_pca_group(
             "log_db": log_db, "pca_mask": pca_mask,
             "epoch_t": t_ephys[0] + (np.arange(epoch_count) + 0.5) * EPOCH_LEN_SEC,
             "locomotion_mask": locomotion_mask,
+            "broadband_artifact_mask": artifact_mask,
+            "selected_exclusion_mask": selected_mask,
         })
 
     combined = np.concatenate(pca_inputs, axis=1)
@@ -391,8 +400,8 @@ def compute_shared_low_freq_pca_group(
         low_series[record["pca_mask"]] = np.nan
         low_by_epoch = _epoch_mean_from_timeseries(record["log_t"], low_series, record["epoch_t"])
         smoothed_unmasked = _adaptive_savgol(low_by_epoch, SAVGOL_BASE_WIN)
-        smoothed = (_adaptive_savgol_masked(low_by_epoch, ~record["locomotion_mask"], SAVGOL_BASE_WIN)
-                    if exclude_locomotion_epochs else smoothed_unmasked)
+        smoothed = (_adaptive_savgol_masked(low_by_epoch, ~record["selected_exclusion_mask"], SAVGOL_BASE_WIN)
+                    if (exclude_locomotion_epochs or exclude_broadband_artifacts) else smoothed_unmasked)
         record.update({
             "low_freq_series": low_series, "low_freq_series_t": record["log_t"],
             "low_freq_power": low_by_epoch,
@@ -708,24 +717,77 @@ def build_locomotion_epoch_mask(epoch_features: Dict, locomotion_threshold: floa
     return mask
 
 
+def detect_broadband_artifact_epoch_mask(
+    eeg,
+    emg,
+    epoch_len_samples=EPOCH_LEN_SAMPLES,
+    robust_z_threshold=BROADBAND_ARTIFACT_ROBUST_Z,
+):
+    """Detect unusually high broadband power in either EEG or EMG."""
+    eeg = np.asarray(eeg, dtype=float)
+    emg = np.asarray(emg, dtype=float)
+    epoch_len_samples = int(epoch_len_samples)
+    n_epochs = min(eeg.size, emg.size) // epoch_len_samples
+    if n_epochs <= 0:
+        return np.zeros(0, dtype=bool)
+    eeg_epochs = eeg[:n_epochs * epoch_len_samples].reshape(n_epochs, epoch_len_samples)
+    emg_epochs = emg[:n_epochs * epoch_len_samples].reshape(n_epochs, epoch_len_samples)
+    eeg_rms = np.sqrt(np.nanmean((eeg_epochs - np.nanmean(eeg_epochs, axis=1, keepdims=True)) ** 2, axis=1))
+    emg_rms = np.sqrt(np.nanmean((emg_epochs - np.nanmean(emg_epochs, axis=1, keepdims=True)) ** 2, axis=1))
+
+    def robust_z(values):
+        center = np.nanmedian(values)
+        mad = np.nanmedian(np.abs(values - center))
+        scale = 1.4826 * mad
+        return np.zeros(values.size) if not np.isfinite(scale) or scale <= 0 else (values - center) / scale
+
+    eeg_z = robust_z(eeg_rms)
+    emg_z = robust_z(emg_rms)
+    return np.isfinite(eeg_z) & np.isfinite(emg_z) & (
+        (eeg_z >= float(robust_z_threshold)) | (emg_z >= float(robust_z_threshold))
+    )
+
+
+def selected_epoch_exclusion_mask(
+    epoch_features: Dict,
+    locomotion_threshold: float,
+    *,
+    exclude_locomotion_epochs=False,
+    exclude_broadband_artifacts=False,
+):
+    """Return the active exclusion mask; the two modes are alternatives."""
+    if exclude_locomotion_epochs and exclude_broadband_artifacts:
+        raise ValueError("locomotion and broadband-artifact exclusion are mutually exclusive")
+    n_epochs = _as_float_array(epoch_features.get("emg_rms_mean", [])).size
+    if exclude_locomotion_epochs:
+        return build_locomotion_epoch_mask(epoch_features, locomotion_threshold)
+    if exclude_broadband_artifacts:
+        mask = np.asarray(epoch_features.get("broadband_artifact_mask", []), dtype=bool)
+        return mask if mask.size == n_epochs else np.zeros(n_epochs, dtype=bool)
+    return np.zeros(n_epochs, dtype=bool)
+
+
 def estimate_thresholds_from_epoch_features(
     epoch_features: Dict,
     default_locomotion_threshold: float = DEFAULT_LOCOMOTION_THRESHOLD,
     exclude_locomotion_epochs: bool = False,
+    exclude_broadband_artifacts: bool = False,
 ) -> Dict[str, float]:
     """
     Estimate thresholds using trough detection on the available epoch metrics.
     """
 
-    locomotion_mask = build_locomotion_epoch_mask(
-        epoch_features, default_locomotion_threshold
-    ) if exclude_locomotion_epochs else None
+    exclusion_mask = selected_epoch_exclusion_mask(
+        epoch_features, default_locomotion_threshold,
+        exclude_locomotion_epochs=exclude_locomotion_epochs,
+        exclude_broadband_artifacts=exclude_broadband_artifacts,
+    )
 
     def _resolve(arr, unmasked_fallback=None):
         arr_vals = _as_float_array(arr)
         filtered_has_values = False
-        if locomotion_mask is not None and locomotion_mask.size == arr_vals.size:
-            filtered_vals = arr_vals[~locomotion_mask]
+        if exclusion_mask.size == arr_vals.size:
+            filtered_vals = arr_vals[~exclusion_mask]
             if np.any(np.isfinite(filtered_vals)):
                 arr_vals = filtered_vals
                 filtered_has_values = True
@@ -836,6 +898,7 @@ def score_from_epoch_features(
     min_sleep_state_sec: float = DEFAULT_MIN_SLEEP_STATE_SEC,
     rem_only_from_nrem: bool = True,
     exclude_locomotion_epochs: bool = False,
+    exclude_broadband_artifacts: bool = False,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
     Classify sleep states given epoch-level summary data.
@@ -880,6 +943,7 @@ def score_from_epoch_features(
         epoch_features,
         default_locomotion_threshold=default_locomotion_threshold,
         exclude_locomotion_epochs=exclude_locomotion_epochs,
+        exclude_broadband_artifacts=exclude_broadband_artifacts,
     )
 
     if auto_thresholds or thresholds is None:
@@ -961,6 +1025,12 @@ def score_from_epoch_features(
         rem_only_from_nrem=rem_only_from_nrem,
     )
 
+    if exclude_broadband_artifacts:
+        artifact_mask = np.asarray(epoch_features.get("broadband_artifact_mask", []), dtype=bool)
+        if artifact_mask.size == n:
+            locomotion_high = np.isfinite(locomotion) & (locomotion > locomotion_thr)
+            out[artifact_mask & ~locomotion_high] = STATE_UNASSIGNED
+            out[artifact_mask & locomotion_high] = STATE_ACTIVE_WAKE
     return out.astype(np.int8), resolved
 
 
@@ -1063,6 +1133,7 @@ def run_sleep_scoring(
     locomotion_threshold=DEFAULT_LOCOMOTION_THRESHOLD,
     min_sleep_state_sec=DEFAULT_MIN_SLEEP_STATE_SEC,
     exclude_locomotion_epochs=False,
+    exclude_broadband_artifacts=False,
     rem_only_from_nrem=True,
     progress_callback=None,
     simulated_npz=None,
@@ -1206,12 +1277,16 @@ def run_sleep_scoring(
             preliminary_n_epochs, EPOCH_LEN_SAMPLES
         )
         preliminary_wheel_mean = np.nanmean(preliminary_wheel_epochs, axis=1)
-        locomotion_epoch_mask = (
-            build_locomotion_epoch_mask(
-                {"wheel_speed_mean": preliminary_wheel_mean},
-                locomotion_threshold,
-            )
-            if exclude_locomotion_epochs
+        locomotion_epoch_mask = build_locomotion_epoch_mask(
+            {"emg_rms_mean": np.zeros(preliminary_n_epochs), "wheel_speed_mean": preliminary_wheel_mean},
+            locomotion_threshold,
+        )
+        artifact_epoch_mask = detect_broadband_artifact_epoch_mask(
+            eeg_filtered, emg_filtered, epoch_len_samples=EPOCH_LEN_SAMPLES
+        )
+        selected_mask = (
+            locomotion_epoch_mask if exclude_locomotion_epochs
+            else artifact_epoch_mask if exclude_broadband_artifacts
             else np.zeros(preliminary_n_epochs, dtype=bool)
         )
         preliminary_epoch_edges = t_ephys[0] + np.arange(
@@ -1219,6 +1294,8 @@ def run_sleep_scoring(
         ) * EPOCH_LEN_SEC
     else:
         locomotion_epoch_mask = np.zeros(0, dtype=bool)
+        artifact_epoch_mask = np.zeros(0, dtype=bool)
+        selected_mask = np.zeros(0, dtype=bool)
         preliminary_epoch_edges = np.array([], dtype=float)
 
     # -------------------------------------------------------------
@@ -1248,7 +1325,7 @@ def run_sleep_scoring(
     log_sxx_resampled = _resample_spectrogram(log_freqs, log_sxx, LOG_SPEC_FREQ_BINS)
     log_sxx_db = np.log10(log_sxx_resampled + 1e-12)
     pca_bin_mask = np.zeros(log_t_abs.size, dtype=bool)
-    if locomotion_epoch_mask.size and preliminary_epoch_edges.size:
+    if selected_mask.size and preliminary_epoch_edges.size:
         epoch_indices = np.searchsorted(
             preliminary_epoch_edges, log_t_abs, side="right"
         ) - 1
@@ -1261,7 +1338,7 @@ def run_sleep_scoring(
     pca_columns = ~pca_bin_mask
     normalization_source = (
         log_sxx_db[:, pca_columns]
-        if exclude_locomotion_epochs and np.any(pca_columns)
+        if (exclude_locomotion_epochs or exclude_broadband_artifacts) and np.any(pca_columns)
         else log_sxx_db
     )
     freq_mean = np.nanmean(normalization_source, axis=1, keepdims=True)
@@ -1272,7 +1349,7 @@ def run_sleep_scoring(
     if np.count_nonzero(low_freq_mask) >= 2:
         low_freq_input = log_sxx_z[low_freq_mask, :]
         valid_pca_columns = pca_columns & np.all(np.isfinite(low_freq_input), axis=0)
-        if exclude_locomotion_epochs and np.any(valid_pca_columns):
+        if (exclude_locomotion_epochs or exclude_broadband_artifacts) and np.any(valid_pca_columns):
             _, low_freq_weights = _first_principal_component(
                 low_freq_input[:, valid_pca_columns]
             )
@@ -1376,8 +1453,8 @@ def run_sleep_scoring(
         theta_delta_ratio_unmasked, SAVGOL_BASE_WIN
     )
     feature_valid_mask = np.ones(n_epochs, dtype=bool)
-    if exclude_locomotion_epochs and locomotion_epoch_mask.size == n_epochs:
-        feature_valid_mask = ~locomotion_epoch_mask
+    if (exclude_locomotion_epochs or exclude_broadband_artifacts) and selected_mask.size == n_epochs:
+        feature_valid_mask = ~selected_mask
         theta_power_epochs = theta_power_epochs.copy()
         delta_power_epochs = delta_power_epochs.copy()
         theta_power_epochs[~feature_valid_mask] = np.nan
@@ -1406,10 +1483,10 @@ def run_sleep_scoring(
         low_freq_by_epoch, SAVGOL_BASE_WIN
     )
     theta_ratio_by_epoch = _epoch_mean_from_timeseries(log_t_abs, theta_ratio_series, epoch_time)
-    if exclude_locomotion_epochs:
+    if exclude_locomotion_epochs or exclude_broadband_artifacts:
         low_freq_power_smoothed = _adaptive_savgol_masked(
             low_freq_by_epoch,
-            ~locomotion_epoch_mask,
+            ~selected_mask,
             SAVGOL_BASE_WIN,
         )
     else:
@@ -1446,6 +1523,7 @@ def run_sleep_scoring(
     epoch_features["theta_delta_ratio_smoothed_unmasked"] = (
         theta_delta_ratio_smoothed_unmasked
     )
+    epoch_features["broadband_artifact_mask"] = np.asarray(artifact_epoch_mask, dtype=bool)
 
     sleep_state_epoch, thresholds_used = score_from_epoch_features(
         epoch_features,
@@ -1453,6 +1531,7 @@ def run_sleep_scoring(
         default_locomotion_threshold=locomotion_threshold,
         min_sleep_state_sec=min_sleep_state_sec,
         exclude_locomotion_epochs=exclude_locomotion_epochs,
+        exclude_broadband_artifacts=exclude_broadband_artifacts,
         rem_only_from_nrem=rem_only_from_nrem,
     )
 
@@ -1566,6 +1645,8 @@ def run_sleep_scoring(
         "delta_power_threshold": float(low_freq_thr),
         "locomotion_threshold": float(locomotion_thr),
         "exclude_locomotion_epochs": bool(exclude_locomotion_epochs),
+        "exclude_broadband_artifacts": bool(exclude_broadband_artifacts),
+        "broadband_artifact_mask": np.asarray(artifact_epoch_mask, dtype=bool),
         "min_sleep_state_sec": float(min_sleep_state_sec),
         "rem_only_from_nrem": bool(rem_only_from_nrem),
 

@@ -39,6 +39,7 @@ from sleep_score import (
     score_from_epoch_features,
     build_epoch_feature_dict,
     build_locomotion_epoch_mask,
+    detect_broadband_artifact_epoch_mask,
     DEFAULT_DELTA_BAND,
     DEFAULT_THETA_BAND,
     DEFAULT_LOW_FREQ_MAX_HZ,
@@ -472,6 +473,14 @@ class ThresholdHistogramDialog(QtWidgets.QDialog):
         self.group_status = QLabel("Current experiment only")
         self.group_status.setStyleSheet("color: gray;")
         layout.addWidget(self.group_status)
+        self.exclude_locomotion_check = QCheckBox("Exclude locomotion epochs")
+        self.exclude_locomotion_check.toggled.connect(
+            self._on_distribution_locomotion_toggled
+        )
+        layout.addWidget(self.exclude_locomotion_check)
+        self.exclude_broadband_check = QCheckBox("Exclude broadband artifact epochs")
+        self.exclude_broadband_check.toggled.connect(self._on_distribution_broadband_toggled)
+        layout.addWidget(self.exclude_broadband_check)
         self.figure = Figure(figsize=(6, 8))
         self.canvas = FigureCanvas(self.figure)
         layout.addWidget(self.canvas)
@@ -495,6 +504,7 @@ class ThresholdHistogramDialog(QtWidgets.QDialog):
         if current_id and (not current_text or current_text == self._last_refreshed_exp_id):
             self.group_ids_edit.setPlainText(current_id)
         self._last_refreshed_exp_id = current_id
+        self.sync_locomotion_checkbox()
         self._disconnect_lines()
         self.figure.clf()
         axes = self.figure.subplots(len(self.METRIC_CONFIG), 1, sharex=False)
@@ -561,6 +571,33 @@ class ThresholdHistogramDialog(QtWidgets.QDialog):
         # until another window event (such as moving the dialog) occurs.
         self.canvas.draw()
 
+    def sync_locomotion_checkbox(self):
+        checked = bool(getattr(self.app, "exclude_locomotion_epochs", False))
+        self.exclude_locomotion_check.blockSignals(True)
+        self.exclude_locomotion_check.setChecked(checked)
+        self.exclude_locomotion_check.blockSignals(False)
+        self.exclude_broadband_check.blockSignals(True)
+        self.exclude_broadband_check.setChecked(bool(getattr(self.app, "exclude_broadband_artifacts", False)))
+        self.exclude_broadband_check.blockSignals(False)
+
+    def _on_distribution_locomotion_toggled(self, checked):
+        main_check = getattr(self.app, "excludeLocomotionCheck", None)
+        if main_check is not None and main_check.isChecked() != bool(checked):
+            main_check.setChecked(bool(checked))
+            return
+        handler = getattr(self.app, "_on_locomotion_mask_toggled", None)
+        if handler is not None:
+            handler(bool(checked))
+
+    def _on_distribution_broadband_toggled(self, checked):
+        main_check = getattr(self.app, "excludeBroadbandArtifactCheck", None)
+        if main_check is not None and main_check.isChecked() != bool(checked):
+            main_check.setChecked(bool(checked))
+            return
+        handler = getattr(self.app, "_on_broadband_artifact_toggled", None)
+        if handler is not None:
+            handler(bool(checked))
+
     def _distribution_values(self, metric_key, data_attr):
         if self.use_group_check.isChecked() and self._group_result is not None:
             if metric_key == "low_freq":
@@ -574,10 +611,10 @@ class ThresholdHistogramDialog(QtWidgets.QDialog):
                 for item in self._group_result["source_states"]:
                     features = item.get("epoch_features", {})
                     current = np.asarray(features.get(feature_key, []), dtype=float).copy()
-                    if self.app.exclude_locomotion_epochs:
-                        moving = build_locomotion_epoch_mask(
-                            features, self.app.locomotion_threshold
-                        )
+                    if self.app.exclude_locomotion_epochs or self.app.exclude_broadband_artifacts:
+                        moving = (build_locomotion_epoch_mask(features, self.app.locomotion_threshold)
+                                  if self.app.exclude_locomotion_epochs else
+                                  np.asarray(features.get("broadband_artifact_mask", []), dtype=bool))
                         if moving.size == current.size:
                             current[moving] = np.nan
                     values.append(current)
@@ -653,6 +690,7 @@ class ThresholdHistogramDialog(QtWidgets.QDialog):
                 low_freq_max_hz=float(self.app.low_freq_max_hz),
                 locomotion_threshold=float(self.app.locomotion_threshold),
                 exclude_locomotion_epochs=bool(self.app.exclude_locomotion_epochs),
+                exclude_broadband_artifacts=bool(self.app.exclude_broadband_artifacts),
                 simulated_npz=self.app._simulation_npz_path(),
                 progress_callback=self._group_progress,
             )
@@ -698,8 +736,10 @@ class ThresholdHistogramDialog(QtWidgets.QDialog):
             features = source.get("epoch_features", {})
             emg = np.asarray(features.get("emg_rms_mean", []), dtype=float).copy()
             ratio = np.asarray(features.get("theta_delta_ratio_smoothed", []), dtype=float).copy()
-            if self.app.exclude_locomotion_epochs:
-                moving = build_locomotion_epoch_mask(features, self.app.locomotion_threshold)
+            if self.app.exclude_locomotion_epochs or self.app.exclude_broadband_artifacts:
+                moving = (build_locomotion_epoch_mask(features, self.app.locomotion_threshold)
+                          if self.app.exclude_locomotion_epochs else
+                          np.asarray(features.get("broadband_artifact_mask", []), dtype=bool))
                 if moving.size == emg.size:
                     emg[moving] = np.nan
                 if moving.size == ratio.size:
@@ -839,6 +879,8 @@ class VideoAnalysisApp(QMainWindow):
         self.delta_power_threshold = None
         self.locomotion_threshold = DEFAULT_LOCOMOTION_THRESHOLD
         self.exclude_locomotion_epochs = False
+        self.exclude_broadband_artifacts = False
+        self.artifact_epoch_mask = np.zeros(0, dtype=bool)
         self.min_sleep_state_sec = DEFAULT_MIN_SLEEP_STATE_SEC
         self.rem_only_from_nrem = True
         self._saved_threshold_values = {}
@@ -1261,6 +1303,10 @@ class VideoAnalysisApp(QMainWindow):
         self.excludeLocomotionCheck.setChecked(False)
         self.excludeLocomotionCheck.toggled.connect(self._on_locomotion_mask_toggled)
         thresholdPanelLayout.addWidget(self.excludeLocomotionCheck, 5, 0, 1, 3)
+        self.excludeBroadbandArtifactCheck = QCheckBox("Exclude broadband artifact epochs from PCA, thresholds, and plots")
+        self.excludeBroadbandArtifactCheck.setChecked(False)
+        self.excludeBroadbandArtifactCheck.toggled.connect(self._on_broadband_artifact_toggled)
+        thresholdPanelLayout.addWidget(self.excludeBroadbandArtifactCheck, 6, 0, 1, 3)
         controlsLayout.addWidget(thresholdPanel)
 
         controlsLayout.addStretch(1)
@@ -1604,6 +1650,7 @@ class VideoAnalysisApp(QMainWindow):
                 min_sleep_state_sec=min_sleep_state_sec,
                 rem_only_from_nrem=rem_only_from_nrem,
                 exclude_locomotion_epochs=bool(self.exclude_locomotion_epochs),
+                exclude_broadband_artifacts=bool(self.exclude_broadband_artifacts),
                 progress_callback=_progress_cb,
                 simulated_npz=self._simulation_npz_path(),
                 filename_suffix=self._simulation_suffix(),
@@ -1634,6 +1681,7 @@ class VideoAnalysisApp(QMainWindow):
 
         self.eeg_10hz = np.asarray(sleep_state['eeg_10hz'], dtype=float)
         self.eeg_10hz_t = np.asarray(sleep_state['eeg_10hz_t'], dtype=float)
+        self.emg_10hz = np.asarray(sleep_state.get('emg_10hz', []), dtype=float)
 
         # epoch-level
         self.epoch_t = np.asarray(sleep_state['epoch_t'], dtype=float)
@@ -1650,6 +1698,11 @@ class VideoAnalysisApp(QMainWindow):
         self.state_epoch_t = np.asarray(sleep_state['state_epoch_t'], dtype=float)
         self.state_10hz = np.asarray(sleep_state['state_10hz'], dtype=int)
         self.state_10hz_t = np.asarray(sleep_state['state_10hz_t'], dtype=float)
+        self.artifact_epoch_mask = np.asarray(sleep_state.get('broadband_artifact_mask', []), dtype=bool)
+        if self.artifact_epoch_mask.size != self.epoch_t.size and self.emg_10hz.size == self.eeg_10hz.size and self.eeg_10hz.size:
+            self.artifact_epoch_mask = detect_broadband_artifact_epoch_mask(self.eeg_10hz, self.emg_10hz, epoch_len_samples=100)
+        if self.artifact_epoch_mask.size != self.epoch_t.size:
+            self.artifact_epoch_mask = np.zeros(self.epoch_t.size, dtype=bool)
 
         # thresholds
         self.emg_rms_threshold = float(sleep_state.get('emg_rms_threshold', np.nan))
@@ -1697,6 +1750,10 @@ class VideoAnalysisApp(QMainWindow):
         self.excludeLocomotionCheck.blockSignals(True)
         self.excludeLocomotionCheck.setChecked(self.exclude_locomotion_epochs)
         self.excludeLocomotionCheck.blockSignals(False)
+        self.exclude_broadband_artifacts = bool(sleep_state.get('exclude_broadband_artifacts', False))
+        self.excludeBroadbandArtifactCheck.blockSignals(True)
+        self.excludeBroadbandArtifactCheck.setChecked(self.exclude_broadband_artifacts)
+        self.excludeBroadbandArtifactCheck.blockSignals(False)
         self.left_video_crop = self._coerce_crop_rect(sleep_state.get("left_video_crop"))
         self.right_video_crop = self._coerce_crop_rect(sleep_state.get("right_video_crop"))
 
@@ -1977,6 +2034,7 @@ class VideoAnalysisApp(QMainWindow):
                 min_sleep_state_sec=classification_settings["min_sleep_state_sec"],
                 rem_only_from_nrem=classification_settings["rem_only_from_nrem"],
                 exclude_locomotion_epochs=bool(self.exclude_locomotion_epochs),
+                exclude_broadband_artifacts=bool(self.exclude_broadband_artifacts),
                 progress_callback=progress_dialog.update_progress,
                 simulated_npz=self._simulation_npz_path(),
                 filename_suffix=self._simulation_suffix(),
@@ -2739,6 +2797,15 @@ class VideoAnalysisApp(QMainWindow):
         features = getattr(self, "epoch_features_data", None) or {}
         return build_locomotion_epoch_mask(features, self.locomotion_threshold)
 
+    def _selected_exclusion_epoch_mask(self):
+        n = np.asarray(getattr(self, 'epoch_t', []), dtype=float).size
+        if self.exclude_locomotion_epochs:
+            features = getattr(self, 'epoch_features_data', None) or {}
+            return build_locomotion_epoch_mask(features, self.locomotion_threshold)
+        if self.exclude_broadband_artifacts and self.artifact_epoch_mask.size == n:
+            return self.artifact_epoch_mask.copy()
+        return np.zeros(n, dtype=bool)
+
     def _epoch_mask_for_times(self, times, epoch_mask):
         times = np.asarray(times, dtype=float)
         epoch_mask = np.asarray(epoch_mask, dtype=bool)
@@ -2754,7 +2821,7 @@ class VideoAnalysisApp(QMainWindow):
     def _threshold_distribution_values(self, data_attr):
         data = getattr(self, data_attr, None)
         values = np.asarray(data, dtype=float) if data is not None else np.array([], dtype=float)
-        mask = self._locomotion_epoch_mask()
+        mask = self._selected_exclusion_epoch_mask()
         if mask.size == values.size and mask.size:
             values = values.copy()
             values[mask] = np.nan
@@ -2762,10 +2829,31 @@ class VideoAnalysisApp(QMainWindow):
 
     def _on_locomotion_mask_toggled(self, checked):
         self.exclude_locomotion_epochs = bool(checked)
+        if checked:
+            self.excludeBroadbandArtifactCheck.blockSignals(True)
+            self.excludeBroadbandArtifactCheck.setChecked(False)
+            self.excludeBroadbandArtifactCheck.blockSignals(False)
+            self.exclude_broadband_artifacts = False
         if not self.loaded:
             return
         self._state_dirty = True
         self._update_save_button_state()
+        self.rerun_classification()
+        self.plotTraces()
+        self._refresh_threshold_histogram_dialog()
+
+    def _on_broadband_artifact_toggled(self, checked):
+        self.exclude_broadband_artifacts = bool(checked)
+        if checked:
+            self.excludeLocomotionCheck.blockSignals(True)
+            self.excludeLocomotionCheck.setChecked(False)
+            self.excludeLocomotionCheck.blockSignals(False)
+            self.exclude_locomotion_epochs = False
+        if not self.loaded:
+            return
+        self._state_dirty = True
+        self._update_save_button_state()
+        self.rerun_classification()
         self.plotTraces()
         self._refresh_threshold_histogram_dialog()
 
@@ -2920,6 +3008,7 @@ class VideoAnalysisApp(QMainWindow):
                 min_sleep_state_sec=float(self.min_sleep_state_sec),
                 rem_only_from_nrem=bool(self.rem_only_from_nrem),
                 exclude_locomotion_epochs=bool(self.exclude_locomotion_epochs),
+                exclude_broadband_artifacts=bool(self.exclude_broadband_artifacts),
             )
         except Exception as exc:
             QMessageBox.critical(self, "Rescore error", f"Error during rescoring:\n{exc}")
@@ -2964,8 +3053,10 @@ class VideoAnalysisApp(QMainWindow):
                 "theta_delta_ratio_smoothed_unmasked",
             )
         )
+        saved_artifact_setting = bool(saved_state.get('exclude_broadband_artifacts', False))
         feature_mask_changed = (
             saved_mask_setting != bool(self.exclude_locomotion_epochs)
+            or saved_artifact_setting != bool(self.exclude_broadband_artifacts)
             or not np.isclose(
                 saved_locomotion_threshold,
                 float(self.locomotion_threshold),
@@ -3248,7 +3339,10 @@ class VideoAnalysisApp(QMainWindow):
 
     def _refresh_threshold_histogram_dialog(self):
         dialog = getattr(self, "_histogram_dialog", None)
-        if dialog is None or not dialog.isVisible():
+        if dialog is None:
+            return
+        dialog.sync_locomotion_checkbox()
+        if not dialog.isVisible():
             return
         dialog.refresh()
 
@@ -3300,6 +3394,8 @@ class VideoAnalysisApp(QMainWindow):
                 state["threshold_distribution_mode"] = "shared_low_freq_pca"
                 state.update(thresholds)
                 state["exclude_locomotion_epochs"] = bool(self.exclude_locomotion_epochs)
+                state["exclude_broadband_artifacts"] = bool(self.exclude_broadband_artifacts)
+                state["broadband_artifact_mask"] = np.asarray(features.get("broadband_artifact_mask", []), dtype=bool)
                 state["min_sleep_state_sec"] = float(self.min_sleep_state_sec)
                 state["rem_only_from_nrem"] = bool(self.rem_only_from_nrem)
                 state_epoch, _ = score_from_epoch_features(
@@ -3310,6 +3406,7 @@ class VideoAnalysisApp(QMainWindow):
                     min_sleep_state_sec=float(self.min_sleep_state_sec),
                     rem_only_from_nrem=bool(self.rem_only_from_nrem),
                     exclude_locomotion_epochs=bool(self.exclude_locomotion_epochs),
+                    exclude_broadband_artifacts=bool(self.exclude_broadband_artifacts),
                 )
                 state["state_epoch"] = np.asarray(state_epoch, dtype=np.int8)
                 state["state_epoch_t"] = np.asarray(source["state_epoch_t"], dtype=np.float64)
@@ -3805,10 +3902,10 @@ class VideoAnalysisApp(QMainWindow):
 
         # masking (existing behaviour)
         epoch_moving = self._compute_epoch_motion_mask()
-        locomotion_mask = self._locomotion_epoch_mask()
-        plot_epoch_mask = epoch_moving | locomotion_mask
-        eeg_time_mask = self._epoch_mask_for_times(self.eeg_10hz_t, locomotion_mask)
-        spectrogram_time_mask = self._epoch_mask_for_times(self.eeg_spectrogram_t, locomotion_mask)
+        selected_exclusion_mask = self._selected_exclusion_epoch_mask()
+        plot_epoch_mask = epoch_moving | selected_exclusion_mask
+        eeg_time_mask = self._epoch_mask_for_times(self.eeg_10hz_t, selected_exclusion_mask)
+        spectrogram_time_mask = self._epoch_mask_for_times(self.eeg_spectrogram_t, selected_exclusion_mask)
         ratio_masked = np.asarray(self.theta_delta_ratio_smoothed, dtype=float)
         if ratio_masked.size > 0:
             ratio_masked = ratio_masked.copy()
@@ -4110,7 +4207,7 @@ class VideoAnalysisApp(QMainWindow):
         t = np.asarray(self.state_epoch_t, dtype=float)
         s = np.asarray(self.state_epoch, dtype=int)
 
-        color_map = {0: 'k', 1: '0.5', 2: 'tab:blue', 3: 'tab:green'}
+        color_map = {-1: 'tab:red', 0: 'k', 1: '0.5', 2: 'tab:blue', 3: 'tab:green'}
 
         if self._is_line_visible("state"):
             for state_val, col in color_map.items():
