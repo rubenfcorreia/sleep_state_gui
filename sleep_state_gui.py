@@ -49,6 +49,8 @@ from sleep_score import (
     DEFAULT_EXP_ID,
     compute_shared_low_freq_pca_group,
     estimate_thresholds_from_epoch_features,
+    STATE_ACTIVE_WAKE,
+    STATE_UNASSIGNED,
 )
 
 
@@ -1889,6 +1891,27 @@ class VideoAnalysisApp(QMainWindow):
         self._sync_threshold_widgets_to_values()
 
         self._rebuild_epoch_features()
+
+        # Older files may persist the artifact mode and mask before the
+        # artifact-derived labels were applied.  Reconcile those labels on
+        # load so the state plot is immediately consistent without requiring
+        # a manual Rescore click.
+        artifact_mask = np.asarray(self.artifact_epoch_mask, dtype=bool)
+        if (
+            self.exclude_broadband_artifacts
+            and artifact_mask.size == self.epoch_t.size
+            and np.any(artifact_mask)
+            and self.state_epoch.size == artifact_mask.size
+        ):
+            locomotion_mask = build_locomotion_epoch_mask(
+                self.epoch_features_data or {}, self.locomotion_threshold
+            )
+            expected_artifact_states = np.where(locomotion_mask, STATE_ACTIVE_WAKE, STATE_UNASSIGNED)
+            if not np.array_equal(
+                self.state_epoch[artifact_mask], expected_artifact_states[artifact_mask]
+            ):
+                self.rerun_classification()
+
         self._refresh_state_controls()
         self._update_save_button_state()
         self._reset_plot_view_on_next_refresh = True
