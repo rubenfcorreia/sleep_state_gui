@@ -4217,8 +4217,8 @@ class VideoAnalysisApp(QMainWindow):
 
         if self.state_label_map is not None:
             try:
-                keys = sorted(int(k) for k in self.state_label_map.keys())
-                labels = [self.state_label_map[k] for k in keys]
+                keys = sorted({int(k) for k in self.state_label_map.keys()} | {-1})
+                labels = [self.state_label_map.get(k, self.state_label_map.get(str(k), 'unassigned' if k == -1 else f'State {k}')) for k in keys]
                 ax6.set_yticks(keys)
                 ax6.set_yticklabels(labels)
                 for tick, key in zip(ax6.get_yticklabels(), keys):
@@ -4226,9 +4226,10 @@ class VideoAnalysisApp(QMainWindow):
             except Exception:
                 pass
         else:
-            ticks = [0, 1, 2, 3]
+            ticks = [-1, 0, 1, 2, 3]
+            labels = ['unassigned', 'active wake', 'quiet wake', 'nrem', 'rem']
             ax6.set_yticks(ticks)
-            ax6.set_yticklabels([str(tk) for tk in ticks])
+            ax6.set_yticklabels(labels)
             for tick, key in zip(ax6.get_yticklabels(), ticks):
                 tick.set_color(color_map.get(key, 'k'))
 
