@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QSlider, QMessageBox, QSizePolicy,
     QCheckBox, QRadioButton, QButtonGroup, QProgressBar, QDoubleSpinBox,
-    QInputDialog, QDialog, QDialogButtonBox, QPlainTextEdit,
+    QInputDialog, QDialog, QDialogButtonBox, QPlainTextEdit, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QTimer
 
@@ -980,11 +980,24 @@ class VideoAnalysisApp(QMainWindow):
         controlsLayout = QVBoxLayout(controlsContainer)
         controlsLayout.setSpacing(8)
 
+        # The controls are taller than the available viewport on shorter
+        # screens. Keep their natural height and let the user scroll the left
+        # pane instead of allowing the lower controls to be clipped.
+        controlsScrollArea = QScrollArea()
+        controlsScrollArea.setWidgetResizable(True)
+        controlsScrollArea.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        controlsScrollArea.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        controlsScrollArea.setWidget(controlsContainer)
+
         plotsContainer = QWidget()
         plotsLayout = QVBoxLayout(plotsContainer)
         plotsLayout.setContentsMargins(0, 0, 0, 0)
 
-        mainLayout.addWidget(controlsContainer, 1)
+        mainLayout.addWidget(controlsScrollArea, 1)
         mainLayout.addWidget(plotsContainer, 4)
 
         # --- Top input fields (two rows to save width) ---
@@ -1311,8 +1324,6 @@ class VideoAnalysisApp(QMainWindow):
         thresholdPanelLayout.addWidget(self.excludeBroadbandArtifactCheck, 6, 0, 1, 3)
         controlsLayout.addWidget(thresholdPanel)
 
-        controlsLayout.addStretch(1)
-
         self.saveButton.setMinimumHeight(44)
         self.saveButton.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.saveButton.setStyleSheet(
@@ -1331,6 +1342,18 @@ class VideoAnalysisApp(QMainWindow):
         )
         self.rescoreButton.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         controlsLayout.addWidget(self.rescoreButton)
+
+        # Keep the control pane wide enough for its longest rows. Without an
+        # explicit minimum, QScrollArea uses a small size hint and the
+        # controls are clipped horizontally when the plot pane expands.
+        controlsContainer.adjustSize()
+        controls_width = controlsContainer.sizeHint().width()
+        scrollbar_width = controlsScrollArea.style().pixelMetric(
+            QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent
+        )
+        controlsScrollArea.setMinimumWidth(
+            controls_width + 2 * controlsScrollArea.frameWidth() + scrollbar_width
+        )
 
         # --- Matplotlib canvas ---
         self.figure = Figure(figsize=(8, 8))
